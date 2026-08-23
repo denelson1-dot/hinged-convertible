@@ -7,37 +7,42 @@
 # across a full fold cycle. Left at the defaults deliberately.
 
 # ---------------------------------------------------------------------------
-# On-screen keyboard.
+# Touch input panel.
 #
-# Onboard's two quirks are preserved as hook data rather than code, because
-# they are properties of Onboard rather than of hinged:
+# A folded convertible has no keyboard, so dictation and the on-screen keyboard
+# both need an on-screen target. The panel is that target, and it drives both:
+# the microphone button talks to vox, the keyboard button launches Onboard.
 #
-#   auto-show must be turned off BEFORE hiding, or the focused text field
-#   reopens the keyboard the instant it is dismissed.
-#
-#   it must be killed with SIGKILL, not SIGTERM: its language-model destructor
-#   crashes on clean shutdown under Python 3.12 and leaves a ~9 MB core dump.
+# It is an override-redirect X11 window, so the window manager never gives it
+# focus -- which matters because tapping it must not steal focus from whatever
+# you are dictating into.
 # ---------------------------------------------------------------------------
 
 [[hooks]]
 event   = "tablet"
-command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "true"]
-
-[[hooks]]
-event   = "tablet"
-command = ["onboard"]
+command = ["hinged-panel"]
 async   = true
 
 [[hooks]]
 event   = "tent"
-command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "true"]
-
-[[hooks]]
-event   = "tent"
-command = ["onboard"]
+command = ["hinged-panel"]
 async   = true
 
-# Order matters here: auto-show off first, then kill.
+[[hooks]]
+event   = "laptop"
+command = ["pkill", "-x", "hinged-panel"]
+ignore_exit = true
+
+[[hooks]]
+event   = "closed"
+command = ["pkill", "-x", "hinged-panel"]
+ignore_exit = true
+
+# The panel opens the keyboard on demand, so unfolding just needs to clean up
+# whatever is still showing. Onboard's two quirks are preserved as hook data
+# rather than code, because they are properties of Onboard, not of hinged:
+# auto-show must be off BEFORE hiding or the focused field reopens it, and it
+# must be SIGKILLed because its destructor crashes under Python 3.12.
 [[hooks]]
 event   = "laptop"
 command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "false"]
@@ -45,18 +50,10 @@ command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "false"]
 [[hooks]]
 event   = "laptop"
 command = ["pkill", "-KILL", "-x", "onboard"]
-# pkill exits 1 when nothing matched, which is the normal case here.
 ignore_exit = true
 
-# ---------------------------------------------------------------------------
-# Dictation, via vox.
-#
-# vox runs as its own always-on service, so nothing needs starting on fold.
-# What matters on unfold is abandoning any recording still in flight: a
-# half-finished dictation that types itself into whatever you opened next is
-# a genuinely unpleasant surprise.
-# ---------------------------------------------------------------------------
-
+# Abandon any dictation still in flight, so a half-finished transcript cannot
+# type itself into whatever you opened next.
 [[hooks]]
 event   = "laptop"
 command = ["vox", "cancel"]

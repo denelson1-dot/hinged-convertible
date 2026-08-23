@@ -44,6 +44,15 @@ say "Installing the binary into $BIN"
 step "mkdir -p '$BIN'"
 step "install -m755 '$REPO/hinged' '$BIN/hinged'"
 
+# The panel is a separate binary so the daemon stays dependency-free: the
+# only third-party package in this repo is the pure-Go X11 client, and it is
+# reachable from the panel alone.
+if CGO_ENABLED=0 go build -trimpath -o "$REPO/hinged-panel" ./cmd/hinged-panel 2>/dev/null; then
+    step "install -m755 '$REPO/hinged-panel' '$BIN/hinged-panel'"
+else
+    echo "    (panel did not build; the daemon works without it)"
+fi
+
 if ((DO_UDEV)); then
     say "Installing udev rules (needs sudo)"
     echo "    /dev/uinput  - to create the virtual switch"

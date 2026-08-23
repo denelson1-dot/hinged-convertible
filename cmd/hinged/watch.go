@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,8 +51,9 @@ func watch() {
 		os.Exit(1)
 	}
 
-	reportInitialSwitchState(switches)
-	go watchSwitches(switches)
+	lid := newLidTracker(switches)
+	reportInitialSwitchState(switches, lid)
+	watchSwitches(switches, lid)
 
 	fmt.Println("\nFold the machine. Ctrl-C to stop.")
 	fmt.Println("Posture transitions are printed as the policy engine commits them.")
@@ -61,7 +63,7 @@ func watch() {
 		blockUntilInterrupt()
 		return
 	}
-	runPolicyLoop(h)
+	runPolicyLoop(h, lid)
 }
 
 func openReadableSwitches(r probe.Report) []*source.Switch {
@@ -85,19 +87,53 @@ func openReadableSwitches(r probe.Report) []*source.Switch {
 // A switch stuck at 1 at startup is the failure that permanently disables the
 // keyboard on affected HP machines; a switch that reads 0 and never changes is
 // the inert case that makes a machine look supported when it is not.
-func reportInitialSwitchState(switches []*source.Switch) {
+func reportInitialSwitchState(switches []*source.Switch, lid *lidTracker) {
 	for _, s := range switches {
 		tablet, err := s.State(source.SwTabletMode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "switch %s: cannot read state: %v\n", s.Name(), err)
 			continue
 		}
-		lid, _ := s.State(source.SwLid)
-		fmt.Printf("switch %-24s SW_TABLET_MODE=%v SW_LID=%v\n", s.Name(), tablet, lid)
+		closed, err := s.State(source.SwLid)
+		if err == nil {
+			lid.set(closed)
+		}
+		fmt.Printf("switch %-24s SW_TABLET_MODE=%v SW_LID=%v\n", s.Name(), tablet, closed)
 	}
 }
 
-func watchSwitches(switches []*source.Switch) {
+// lidTracker holds the most recent lid state so the policy can use it.
+//
+// Without this the lid override is inert: a shut lid must never assert tablet
+// mode, and at startup the lid is the only thing that distinguishes a machine
+// folded past 360 from one simply closed.
+type lidTracker struct {
+	mu    sync.RWMutex
+	known bool
+	state bool // true == closed
+}
+
+// newLidTracker reports lid state only when some device actually provides it,
+// so an absent lid switch stays absent rather than defaulting to "open".
+func newLidTracker(switches []*source.Switch) *lidTracker { return &lidTracker{} }
+
+func (l *lidTracker) set(closed bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.known, l.state = true, closed
+}
+
+func (l *lidTracker) get() *bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if !l.known {
+		return nil
+	}
+	v := l.state
+	return &v
+}
+
+func watchSwitches(switches []*source.Switch, lid *lidTracker) {
 	for _, s := range switches {
 		go func(s *source.Switch) {
 			for {
@@ -111,6 +147,7 @@ func watchSwitches(switches []*source.Switch) {
 					name = "SW_TABLET_MODE"
 				case source.SwLid:
 					name = "SW_LID"
+					lid.set(ev.Value)
 				default:
 					continue
 				}
@@ -121,7 +158,7 @@ func watchSwitches(switches []*source.Switch) {
 	}
 }
 
-func runPolicyLoop(h *source.Hinge) {
+func runPolicyLoop(h *source.Hinge, lid *lidTracker) {
 	cfg := policy.DefaultConfig()
 	st := policy.State{}
 
@@ -147,9 +184,10 @@ func runPolicyLoop(h *source.Hinge) {
 
 			var tr *policy.Transition
 			st, tr = policy.Step(st, policy.Reading{
-				Angle:   &deg,
-				Trusted: true,
-				At:      now,
+				Angle:     &deg,
+				LidClosed: lid.get(),
+				Trusted:   true,
+				At:        now,
 			}, cfg)
 
 			// Print the angle only when it moves meaningfully, so a stationary

@@ -1,0 +1,57 @@
+# hinged - grant read access to posture switch devices only.
+#
+# ORDERING MATTERS. ID_INPUT_SWITCH is set by systemd's 60-input-id.rules,
+# which runs IMPORT{builtin}="input_id". A rule numbered 60 sorts before that
+# file ("60-hinged" < "60-input-id") and would test a property that does not
+# exist yet, so it silently never matches on a cold boot. It appears to work
+# after `udevadm trigger` only because udev restores previously stored
+# properties from /run/udev/data. The tag must also be applied before
+# 70-uaccess.rules consumes it. 70-hinged sorts after 60-input-id and before
+# 70-uaccess, which is the window this needs.
+#
+# systemd's own consumer of this property, 70-power-switch.rules, is numbered
+# 70 for exactly the same reason.
+#
+# Lid and tablet-mode switches live on /dev/input/event*, which is
+# crw-rw---- root:input. Rather than adding the user to the `input` group -
+# which grants read access to EVERY input device including the keyboard, and
+# so permits keylogging by any process in the session - this tags only
+# switch-capable devices.
+#
+# TAG+="uaccess" grants an ACL to the currently active LOCAL session only. It
+# is revoked on logout and does not apply to remote sessions. Note that uaccess
+# is implemented by systemd-logind: on OpenRC, runit or s6 systems it does
+# nothing, and the group-based rule at the bottom of this file is the
+# alternative. `hinged doctor` detects which applies.
+#
+# ID_INPUT_KEY is excluded because udev sets ID_INPUT_SWITCH purely on the
+# presence of EV_SW, and the two are not mutually exclusive. On an HP ENVY
+# x360, "HP WMI hotkeys" (event12) carries both SW_TABLET_MODE and real key
+# events, so granting it would expose keystrokes. Excluding it is safe there
+# because "Intel Virtual Switches" (event11) reports the same SW_TABLET_MODE
+# and carries no keys.
+#
+# If your machine reports tablet mode ONLY on a device that also has keys,
+# `hinged doctor` will say so, and you can uncomment the wider rule below
+# after deciding you are comfortable with it.
+#
+# Install:
+#   sudo install -m644 70-hinged-switch.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# Distribution packages should install to /usr/lib/udev/rules.d instead.
+
+ACTION=="remove", GOTO="hinged_end"
+SUBSYSTEM!="input", GOTO="hinged_end"
+KERNEL!="event*", GOTO="hinged_end"
+
+ENV{ID_INPUT_SWITCH}=="1", ENV{ID_INPUT_KEY}!="1", TAG+="uaccess"
+
+# Wider variant: also covers switch devices that carry key events. Uncomment
+# only if `hinged doctor` reports that this machine has no key-free switch.
+#ENV{ID_INPUT_SWITCH}=="1", TAG+="uaccess"
+
+# Non-systemd fallback: uaccess needs logind. Uncomment ONE of these and add
+# yourself to the named group if your init does not provide logind.
+#ENV{ID_INPUT_SWITCH}=="1", ENV{ID_INPUT_KEY}!="1", GROUP="input", MODE="0640"
+
+LABEL="hinged_end"

@@ -11,9 +11,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/denelson1-dot/hinged-convertible/internal/source"
 )
 
 // Linux evdev switch codes. The SW bitmap in /proc/bus/input/devices is a hex
@@ -78,28 +79,14 @@ type SwitchDevice struct {
 	Access     Access
 }
 
-// HingeSensor is an IIO device reporting a hinge angle.
+// HingeSensor is an IIO device reporting a hinge angle, as discovered by the
+// source package. Sharing that discovery is deliberate: if doctor and the
+// daemon used different rules for what counts as a hinge sensor, doctor would
+// confidently report a mechanism the daemon then fails to open.
 type HingeSensor struct {
-	Path   string
-	Name   string
-	Label  string
-	Raw    string // path to in_angl0_raw
-	Scale  *float64
-	Offset *float64
-	Access Access
-}
-
-// Units reports how a raw reading converts to degrees.
-//
-// The IIO ABI specifies angles in radians after scale and offset are applied.
-// The original single-machine implementation this project grew from assumed
-// the raw value was already degrees, which happened to be true on its hardware
-// and is not true in general.
-func (h HingeSensor) Units() string {
-	if h.Scale == nil {
-		return "raw (no scale attribute; value is likely already degrees)"
-	}
-	return fmt.Sprintf("radians after scale=%g", *h.Scale)
+	source.HingeInfo
+	Access  Access
+	Reading string
 }
 
 // AccelSensor is an IIO accelerometer. A lid/base pair can be used to compute
@@ -107,7 +94,6 @@ func (h HingeSensor) Units() string {
 type AccelSensor struct {
 	Path   string
 	Name   string
-	Label  string
 	Access Access
 }
 
@@ -242,56 +228,33 @@ func readSwitches() []SwitchDevice {
 	return out
 }
 
-// readIIO enumerates the IIO subsystem, separating hinge-angle sensors from
-// accelerometers. Device numbering is not stable across boots, so everything
-// is matched by name or label and never by index.
+// readIIO reports hinge and accelerometer sensors using the same discovery
+// the daemon uses.
 func readIIO() ([]HingeSensor, []AccelSensor) {
-	paths, _ := filepath.Glob("/sys/bus/iio/devices/iio:device*")
-	sort.Strings(paths)
-
 	var hinges []HingeSensor
-	var accels []AccelSensor
-
-	for _, p := range paths {
-		name := strings.TrimSpace(readFile(filepath.Join(p, "name")))
-		label := strings.TrimSpace(readFile(filepath.Join(p, "label")))
-
-		raw := filepath.Join(p, "in_angl0_raw")
-		if _, err := os.Stat(raw); err == nil {
-			h := HingeSensor{
-				Path:   p,
-				Name:   name,
-				Label:  label,
-				Raw:    raw,
-				Access: checkAccess(raw),
-				Scale:  readFloat(filepath.Join(p, "in_angl0_scale")),
-				Offset: readFloat(filepath.Join(p, "in_angl0_offset")),
+	for _, info := range source.DiscoverHinges() {
+		h := HingeSensor{HingeInfo: info, Access: checkAccess(info.Raw)}
+		if h.Access.Readable {
+			if s, err := source.OpenHinge(); err == nil {
+				if deg, err := s.Degrees(); err == nil {
+					h.Reading = fmt.Sprintf("%.1f degrees", deg)
+				} else {
+					h.Reading = "unreadable: " + err.Error()
+				}
 			}
-			hinges = append(hinges, h)
-			continue
 		}
-		if strings.Contains(name, "accel") || strings.Contains(label, "accel") {
-			accels = append(accels, AccelSensor{
-				Path:   p,
-				Name:   name,
-				Label:  label,
-				Access: checkAccess(filepath.Join(p, "name")),
-			})
-		}
+		hinges = append(hinges, h)
+	}
+
+	var accels []AccelSensor
+	for _, dir := range source.DiscoverAccelerometers() {
+		accels = append(accels, AccelSensor{
+			Path:   dir,
+			Name:   strings.TrimSpace(readFile(filepath.Join(dir, "name"))),
+			Access: checkAccess(filepath.Join(dir, "in_accel_x_raw")),
+		})
 	}
 	return hinges, accels
-}
-
-func readFloat(path string) *float64 {
-	s := strings.TrimSpace(readFile(path))
-	if s == "" {
-		return nil
-	}
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return nil
-	}
-	return &v
 }
 
 // choose applies the detection priority and explains the outcome. The
@@ -334,7 +297,7 @@ func choose(r Report) (string, []string) {
 	if len(r.Hinges) > 0 {
 		h := r.Hinges[0]
 		notes = append(notes, fmt.Sprintf(
-			"Hinge angle sensor present at %s (%s), %s.", h.Path, h.Name, h.Access))
+			"Hinge angle sensor present at %s (name=%s), %s.", h.Dir, h.Name, h.Access))
 		if len(tabletSwitches) > 0 {
 			notes = append(notes,
 				"Both a switch and a hinge sensor are present. If the switch turns out to be "+
@@ -348,6 +311,13 @@ func choose(r Report) (string, []string) {
 
 	if len(tabletSwitches) > 0 {
 		return "evdev-switch", notes
+	}
+	if r.Machine.ChassisType == 32 {
+		notes = append(notes,
+			"DMI reports this chassis as Detachable. On a detachable the keyboard "+
+				"separates rather than folding, so there is no hinge angle to threshold "+
+				"and the kernel switch is authoritative. Angle-based policy does not apply.")
+		return "detachable", notes
 	}
 	if len(r.Accels) >= 2 {
 		notes = append(notes, fmt.Sprintf(

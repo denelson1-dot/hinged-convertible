@@ -6,6 +6,7 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/denelson1-dot/hinged-convertible/internal/policy"
 	"github.com/denelson1-dot/hinged-convertible/internal/probe"
 )
 
@@ -73,8 +74,13 @@ func doctor() {
 		fmt.Println("  none")
 	}
 	for _, h := range r.Hinges {
-		fmt.Fprintf(w, "  %s\tname=%s\t%s\n", h.Path, orNone(h.Name), h.Access)
+		fmt.Fprintf(w, "  %s\tname=%s\t%s\n", h.Dir, orNone(h.Name), h.Access)
+		fmt.Fprintf(w, "  \tattribute\t%s\n", h.Raw)
 		fmt.Fprintf(w, "  \tunits\t%s\n", h.Units())
+		fmt.Fprintf(w, "  \tpoll\tevery %v\n", h.Period)
+		if h.Reading != "" {
+			fmt.Fprintf(w, "  \treading\t%s\n", h.Reading)
+		}
 	}
 	w.Flush()
 
@@ -84,6 +90,22 @@ func doctor() {
 	}
 	for _, a := range r.Accels {
 		fmt.Fprintf(w, "  %s\tname=%s\t%s\n", a.Path, orNone(a.Name), a.Access)
+	}
+	w.Flush()
+
+	// The slew gate is a rate test and goes inert past a known interval, so a
+	// slow sensor silently loses that defence. Say so rather than implying a
+	// protection that is not active.
+	cfg := policy.DefaultConfig()
+	if ceil := policy.SlewGateCeiling(cfg); ceil > 0 {
+		for _, h := range r.Hinges {
+			if h.Period > ceil {
+				fmt.Printf("\n  note: this sensor polls every %v, beyond the %v ceiling at which\n"+
+					"        the slew-rate glitch filter can still reject anything. Posture\n"+
+					"        safety here rests on the wrap guard and corroboration instead.\n",
+					h.Period, ceil)
+			}
+		}
 	}
 	w.Flush()
 

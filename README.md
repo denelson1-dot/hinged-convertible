@@ -68,12 +68,18 @@ function with no I/O — so all of it is tested without hardware.
 - **Hysteresis.** Enter tablet at ≥210°, return to laptop at ≤180°. The dead
   band between them is what stops the posture flapping while the hinge rests
   near a threshold. Never set them equal.
-- **Wrap guard.** The sensor wraps 360→0 at full fold, so a reading of 5° means
-  *folded all the way back*, not *lying open flat*. Without this the machine
-  flips to laptop mode at the exact moment it becomes a tablet.
-- **Asymmetric debounce.** One sample to enter tablet mode, three to leave.
-  Entering late means the keyboard is already face-down registering keypresses;
-  leaving early is merely inconvenient.
+- **Wrap guard.** The sensor wraps 360→0 at full fold, so a small angle can mean
+  *folded all the way back* — but it can equally mean a shut lid or a sensor
+  glitch. The angle alone cannot tell them apart, so the decision uses the
+  physical path instead: you cannot reach a wrapped near-zero from laptop
+  posture without passing through tent and tablet first, so from laptop such a
+  reading is always rejected. At startup, where there is no path to reason from,
+  the lid switch settles it.
+- **Asymmetric debounce.** One sample to enter tablet mode on the ordinary path,
+  three when the evidence is weak (startup, after a gap, near-zero angles), and
+  accumulated evidence to leave. Entering late means the keyboard is already
+  face-down registering keypresses; asserting wrongly means the keyboard stops
+  working. The second error is worse, so ambiguity always costs corroboration.
 - **Slew gate.** Angular change faster than 720°/s is rejected as a glitch. The
   comparison is circular, so the genuine 359°→0° wrap is a 1° move and is never
   rejected. This is not theoretical — see [Hardware notes](#hardware-notes).
@@ -86,16 +92,26 @@ function with no I/O — so all of it is tested without hardware.
 
 ## Safety
 
-The worst failure in this domain is a machine left with no working input. Design
-rules, in order of importance:
+The worst failure in this domain is a machine left with no working input.
 
-1. **Synthesis fails safe.** If the daemon dies, the virtual switch disappears
-   and libinput re-enables everything by itself. This is a structural advantage
-   over `xinput disable` and over the `inhibited` sysfs knob, neither of which
-   restores itself.
-2. **Release before cleanup.** Returning to laptop mode restores input first and
-   does slower work after.
-3. **A dead-man timer** releases the switch if the sensor stops reporting.
+**Synthesis does not fail safe, and you should not assume it does.** An earlier
+version of this README claimed that if the daemon dies the virtual switch
+disappears and libinput re-enables everything. That is false, and the asymmetry
+is visible in libinput's own source. When a tablet-mode switch device is
+removed while asserting, the touchpad path calls `tp_resume()`
+([`evdev-mt-touchpad.c`][tp-resume]) but the keyboard path only detaches its
+listener and nulls the pointer, never calling `fallback_resume()`
+([`evdev-fallback.c`][kbd-noresume]). The keyboard was suspended by closing its
+fd, and only a switch event of `0` reopens it — an event a destroyed device can
+never send.
+
+So a `SIGKILL`, OOM kill or panic while asserting can return your touchpad and
+leave the internal keyboard dead until the compositor rebuilds its libinput
+context. The mitigations that actually work are to emit an explicit
+`SW_TABLET_MODE = 0` before destroying the device on every ordinary exit path,
+to emit `0` at startup so a restart clears a latched state, and to run under a
+supervisor that can do the same. Those are **not yet implemented** — see the
+roadmap.
 
 If you are ever stuck with a dead keyboard, switch to a TTY and:
 
@@ -103,9 +119,33 @@ If you are ever stuck with a dead keyboard, switch to a TTY and:
 sudo systemctl stop hinged
 ```
 
+That works because the kernel VT console reads evdev directly rather than
+through libinput.
+
+[tp-resume]: https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-mt-touchpad.c
+[kbd-noresume]: https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-fallback.c
+
+### Does libinput even suspend the keyboard on this hardware?
+
+Possibly not. `fallback_pair_tablet_mode` refuses to pair a keyboard with a
+tablet-mode switch unless that keyboard is tagged `EVDEV_TAG_INTERNAL_KEYBOARD`,
+which comes from an `ID_INTEGRATION` udev property. On the reference machine:
+
+```
+$ udevadm info -q property -n /dev/input/event3 | grep -c ID_INTEGRATION
+0                                    # the AT internal keyboard: absent
+$ udevadm info -q property -n /dev/input/event8 | grep INTEGRATION
+ID_INPUT_TOUCHPAD_INTEGRATION=internal   # the touchpad: present
+```
+
+So a synthesized switch may suspend the touchpad and not the keyboard here.
+Confirming this with `libinput debug-events` is the first task on the roadmap,
+because it decides whether switch synthesis alone is sufficient or whether a
+direct-inhibition fallback is mandatory.
+
 ## Install
 
-Requires Go 1.24+ to build. No runtime dependencies.
+Requires the Go toolchain named in `go.mod`. No runtime dependencies.
 
 ```sh
 git clone https://github.com/denelson1-dot/hinged-convertible
@@ -115,17 +155,20 @@ CGO_ENABLED=0 go build -o hinged ./cmd/hinged
 ```
 
 Reading the hinge angle needs no privileges. Reading the kernel's switch devices
-does; `packaging/udev/60-hinged-switch.rules` grants access to switch devices
-only — not keyboards, touchpads or touchscreens — and only to the locally
-active user:
+does; `packaging/udev/70-hinged-switch.rules` grants access to switch devices
+only, and only to the locally active user. The rule is numbered 70 on purpose:
+`ID_INPUT_SWITCH` is set by systemd's `60-input-id.rules`, so a rule numbered 60
+sorts *before* the property exists and silently never matches on a cold boot.
 
 ```sh
-sudo install -m644 packaging/udev/60-hinged-switch.rules /etc/udev/rules.d/
+sudo install -m644 packaging/udev/70-hinged-switch.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ```
 
 This is deliberately narrower than `usermod -aG input $USER`, which would grant
 your whole session read access to every input device including the keyboard.
+Note that `uaccess` is implemented by systemd-logind; on OpenRC, runit or s6 the
+tag does nothing and the group-based alternative in the rule file applies.
 
 ## Commands
 
@@ -141,18 +184,27 @@ on similar hardware:
 
 **Reading IIO sensor attributes from Go is unreliable.** A HID-sensor attribute
 read triggers a round trip to the sensor hub, and the driver intermittently
-answers `0` rather than waiting. Go's `os` package makes this much worse,
-because it opens pollable descriptors non-blocking and registers them with the
-runtime poller. Measured at 20 samples/second with the hinge stationary at 110°:
+answers `0` rather than waiting. Reading through Go's `os` package is
+measurably worse than issuing the syscalls directly. Interleaved A/B at 20
+samples/second with the hinge stationary:
 
 | Method | Bad reads |
 |---|---|
-| `os.ReadFile` | 3.7% (11 of 293) |
-| `syscall.Open` + `Read` | 0.24% (1 of 418) |
+| `os.ReadFile` | ~3% |
+| `syscall.Open` + `Read` | ~0.3% |
 
-Raw syscalls cut it roughly fifteen-fold but do not eliminate it, which is why
-the slew gate exists. A spurious `0` is indistinguishable from a fully folded
-hinge — unfiltered, it switches your keyboard off at random.
+**The mechanism is not known.** An earlier version of this file blamed
+`O_NONBLOCK` and the runtime poller. That explanation was tested and is wrong:
+an `os.NewFile` wrapper around a plain *blocking* descriptor, never registered
+with the poller, is affected just as badly. Something in the `os.File` read path
+is responsible, but this project has not identified what. The effect replicates;
+the cause is open.
+
+Raw syscalls reduce the glitch rate by roughly an order of magnitude but do not
+eliminate it, which is why the policy layer also refuses to read a near-zero
+angle as a fold unless the physical path supports it. A spurious `0` is
+otherwise indistinguishable from a fully folded hinge, and unfiltered it
+switches your keyboard off at random.
 
 **Angle units are not degrees by default.** The IIO ABI specifies radians after
 `scale` and `offset` are applied. This machine's `in_angl_scale` is
@@ -174,11 +226,28 @@ here, so polling faster than 20 Hz only re-reads unchanged values.
 - [x] Pure policy engine with hysteresis, wrap guard, debounce, slew gate
 - [x] `doctor` — permission-aware hardware probe
 - [x] `watch` — live read-only posture decisions
-- [ ] `uinput` switch synthesis ← the core deliverable
+- [ ] **Verify libinput honours a synthetic switch on real hardware** ← blocks everything
+- [ ] `uinput` switch synthesis, with explicit release before device destroy
+- [ ] Dead-man timer: release the switch when the sensor stops reporting
+- [ ] Configurable thresholds — currently compiled in, which is the main
+      portability limit for other chassis
 - [ ] Switch-health auditing and repair for lying firmware
 - [ ] Command hooks and D-Bus API
 - [ ] Accelerometer-pair angle derivation
 - [ ] Optional offline voice dictation module
+
+## Testing
+
+`internal/policy` is pure and covered at ~96%, including a fuzz target. The
+hardware-facing packages (`probe`, `source`, `cmd`) currently have **no tests at
+all**, so overall statement coverage is about 17%. Most of what they do is
+string and sysfs parsing that could be tested against fixtures without hardware;
+that it is not yet is a gap, not a constraint.
+
+```sh
+go test ./...                      # policy only
+go test -coverpkg=./... ./...      # honest overall number
+```
 
 ## Prior art
 
@@ -188,6 +257,10 @@ here, so polling faster than 20 Hz only re-reads unchanged values.
   disabling. `hinged` gives it a switch to react to.
 - **[iio-sensor-proxy]** — the standard rotation provider. Explicitly
   [declined][isp199] tablet-mode detection. `hinged` leaves rotation to it.
+- **libinput device quirks** — if your machine's problem is *lying* firmware
+  rather than *missing* firmware, `ModelTabletModeSwitchUnreliable` in libinput's
+  quirks database may fix it with no daemon, no `/dev/uinput` and no privileges.
+  Try that first.
 - **[minibook-dual-accelerometer]** — the best existing thresholding policy, and
   the source of the jerk/tilt-gating ideas here. Chuwi MiniBook only, needs a
   DKMS module.

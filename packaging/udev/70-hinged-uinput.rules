@@ -1,0 +1,26 @@
+# hinged - allow the daemon to create the synthetic SW_TABLET_MODE device.
+#
+# /dev/uinput is crw------- root:root by default, so creating a virtual input
+# device requires root.
+#
+# SECURITY, STATED PLAINLY: write access to /dev/uinput is the ability to
+# synthesize arbitrary input - including keystrokes - into the active session.
+# That is a strictly larger capability than the read access this project
+# declines to grant via `usermod -aG input`, so granting it to the whole
+# `input` group would be inconsistent. systemd deliberately ships no uinput
+# rule at all for this reason.
+#
+# The preferred arrangement is therefore NOT this file: run the daemon as a
+# system service with DeviceAllow=/dev/uinput rw, so the capability belongs to
+# one hardened unit rather than to every process a user runs.
+#
+# This file exists for development and for people who understand the tradeoff.
+# uaccess scopes it to the active local session rather than a persistent group,
+# which is the lesser of the two evils.
+#
+# static_node= is required because the uinput module is often not loaded when
+# udev processes rules, so there is no device node yet to apply a mode to.
+
+ACTION=="remove", GOTO="hinged_uinput_end"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+LABEL="hinged_uinput_end"

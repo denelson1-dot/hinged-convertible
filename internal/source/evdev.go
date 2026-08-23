@@ -87,7 +87,43 @@ func OpenSwitch(handler, name string) (*Switch, error) {
 		}
 		return nil, err
 	}
-	return &Switch{name: name, path: path, f: f}, nil
+	s := &Switch{name: name, path: path, f: f}
+
+	// evdev minor numbers are recycled, so the eventN that was enumerated may
+	// not be the device now behind that name -- across a suspend, a driver
+	// rebind, or a hotplug. Confirm identity before trusting it as a posture
+	// source.
+	if actual, err := s.deviceName(); err == nil && name != "" && actual != name {
+		f.Close()
+		return nil, fmt.Errorf("%s is now %q, expected %q: device numbering changed", path, actual, name)
+	}
+	return s, nil
+}
+
+// eviocgname is EVIOCGNAME(256): read the device name.
+const eviocgname = (2 << 30) | (256 << 16) | (0x45 << 8) | 0x06
+
+func (s *Switch) deviceName() (string, error) {
+	rc, err := s.f.SyscallConn()
+	if err != nil {
+		return "", err
+	}
+	var buf [256]byte
+	var errno syscall.Errno
+	if err := rc.Control(func(fd uintptr) {
+		_, _, errno = syscall.Syscall(
+			syscall.SYS_IOCTL, fd, uintptr(eviocgname), uintptr(unsafe.Pointer(&buf[0])))
+	}); err != nil {
+		return "", err
+	}
+	if errno != 0 {
+		return "", errno
+	}
+	n := 0
+	for n < len(buf) && buf[n] != 0 {
+		n++
+	}
+	return string(buf[:n]), nil
 }
 
 // Name returns the device name reported by the kernel.

@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package probe discovers what a machine can tell us about its posture.
 //
 // Everything here works from /proc and /sys and needs no privileges. That is
@@ -9,6 +11,7 @@ package probe
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -183,23 +186,40 @@ func readSwitches() []SwitchDevice {
 		return nil
 	}
 	defer f.Close()
+	devs, err := parseSwitches(f)
+	if err != nil {
+		return nil
+	}
+	for i := range devs {
+		if devs[i].Handler != "" {
+			devs[i].DevNode = "/dev/input/" + devs[i].Handler
+			devs[i].Access = checkAccess(devs[i].DevNode)
+		}
+	}
+	return devs
+}
 
+// parseSwitches reads the /proc/bus/input/devices format.
+//
+// Split out from the file access so it can be tested against fixtures, and
+// because the format is attacker-influenced: device names are copied verbatim
+// from uinput and from USB product strings with no sanitisation, so a name
+// containing a newline can forge an entire record. Records are therefore
+// bounded by structure rather than trusted, and a name is never allowed to
+// introduce one.
+func parseSwitches(r io.Reader) ([]SwitchDevice, error) {
 	var out []SwitchDevice
 	var cur SwitchDevice
 	var haveSW bool
 
 	flush := func() {
 		if haveSW && (cur.TabletMode || cur.Lid) {
-			if cur.Handler != "" {
-				cur.DevNode = "/dev/input/" + cur.Handler
-				cur.Access = checkAccess(cur.DevNode)
-			}
 			out = append(out, cur)
 		}
 		cur, haveSW = SwitchDevice{}, false
 	}
 
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
 		switch {
@@ -216,7 +236,15 @@ func readSwitches() []SwitchDevice {
 				}
 			}
 		case strings.HasPrefix(line, "B: SW="):
-			mask, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "B: SW=")), 16, 64)
+			// The kernel prints multi-word bitmaps space-separated, most
+			// significant word first. SW_CNT is currently 16 so only one word
+			// appears, but parsing the whole remainder as a single number would
+			// silently drop the device the day that changes.
+			fields := strings.Fields(strings.TrimPrefix(line, "B: SW="))
+			if len(fields) == 0 {
+				continue
+			}
+			mask, err := strconv.ParseUint(fields[len(fields)-1], 16, 64)
 			if err == nil {
 				haveSW = true
 				cur.TabletMode = mask&(1<<swTabletMode) != 0
@@ -224,8 +252,13 @@ func readSwitches() []SwitchDevice {
 			}
 		}
 	}
+	// A truncated read is not an empty device list. Silently returning a
+	// partial record from a discovery tool would be worse than saying nothing.
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("parsing input device list: %w", err)
+	}
 	flush()
-	return out
+	return out, nil
 }
 
 // readIIO reports hinge and accelerometer sensors using the same discovery

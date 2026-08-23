@@ -152,6 +152,11 @@ type Config struct {
 	// eventually forces a fresh baseline.
 	RejectDecay float64
 
+	// SensorLostGrace is how long the switch may stay asserted with no fresh
+	// reading before Tick force-releases it. Zero disables the dead-man path,
+	// which is only appropriate when something else guarantees release.
+	SensorLostGrace time.Duration
+
 	// StaleAfter is the gap in data after which the previous reading is no
 	// longer a meaningful baseline. Readings after such a gap are treated as
 	// ambiguous.
@@ -175,6 +180,7 @@ func DefaultConfig() Config {
 		RejectTolerance:  3,
 		RejectDecay:      0.5,
 		StaleAfter:       2 * time.Second,
+		SensorLostGrace:  5 * time.Second,
 	}
 }
 
@@ -223,13 +229,18 @@ func (c Config) Validate() error {
 // hardware cannot supply that signal, which is common: many machines expose a
 // lid switch but no hinge angle, or vice versa.
 type Reading struct {
-	// Angle is the hinge angle in degrees, or nil if unavailable. Values are
-	// normalised into [0, 360) before use; non-finite values are discarded.
-	Angle *float64
+	// Angle is the hinge angle in degrees. Values are normalised into
+	// [0, 360) before use; non-finite values are discarded.
+	//
+	// A value type with an explicit presence flag rather than a *float64:
+	// nothing can be nil-dereferenced, Reading stays comparable, and it
+	// serialises directly for the D-Bus API.
+	Angle    float64
+	HasAngle bool
 
-	// LidClosed is the lid switch state, or nil if unavailable. A closed lid
-	// overrides the angle entirely.
-	LidClosed *bool
+	// LidClosed is the lid switch state. A closed lid overrides the angle
+	// entirely, so "unknown" and "open" must stay distinguishable.
+	LidClosed OptBool
 
 	// Trusted is false when the source knows this reading is unreliable, such
 	// as an accelerometer-derived angle taken while the machine is moving.
@@ -242,27 +253,93 @@ type Reading struct {
 	At time.Time
 }
 
+// OptBool is a bool that may be absent. Many machines expose a lid switch but
+// no hinge angle, or the reverse, and conflating "absent" with "false" here
+// would mean a missing lid switch reading as a permanently open lid.
+type OptBool struct {
+	Value   bool
+	Present bool
+}
+
+// Bool returns a present OptBool.
+func Bool(v bool) OptBool { return OptBool{Value: v, Present: true} }
+
+// IsClosed reports whether the lid is known to be closed.
+func (o OptBool) IsClosed() bool { return o.Present && o.Value }
+
+// IsOpen reports whether the lid is known to be open. This is deliberately not
+// the negation of IsClosed: an absent reading is neither.
+func (o OptBool) IsOpen() bool { return o.Present && !o.Value }
+
 // State is the policy's memory between readings. The zero value is a valid
 // starting state meaning "nothing decided yet".
 type State struct {
-	// Posture is the currently committed posture. It is read-only for callers;
-	// constructing a State with a Posture set skips the debounce and
-	// plausibility history that makes the decision safe.
-	Posture Posture
-
+	posture       Posture
 	candidate     Posture
 	samples       int
 	leaveEvidence float64
 	ambiguous     bool // the next assertion needs extra corroboration
-	lastAngle     *float64
+	lastAngle     float64
+	hasLast       bool
 	lastAt        time.Time
 	rejectScore   float64
 }
+
+// Posture returns the committed posture. It is an accessor rather than a field
+// so that a caller cannot desynchronise it from the debounce and plausibility
+// history that makes the decision safe.
+func (s State) Posture() Posture { return s.posture }
 
 // Rejected reports the accumulated rejection evidence against the current
 // baseline. A persistently non-zero value means the sensor is fighting the
 // policy, which is a different diagnosis from a sensor that has gone silent.
 func (s State) Rejected() float64 { return s.rejectScore }
+
+// Reason explains why a posture was chosen. It is an enumeration rather than a
+// string so that logs, the D-Bus API and `hinged doctor` can switch on it
+// instead of matching prose.
+type Reason int
+
+const (
+	ReasonNone Reason = iota
+	ReasonLidClosed
+	ReasonWrapped
+	ReasonStartupFolded
+	ReasonUnreachable
+	ReasonDeadBand
+	ReasonAboveTablet
+	ReasonAboveTent
+	ReasonBelowLaptop
+	ReasonSensorLost
+)
+
+// String returns a human-readable explanation. "Why did my keyboard just switch
+// off" is the question this project exists to answer, so every transition
+// carries an answer.
+func (r Reason) String() string {
+	switch r {
+	case ReasonLidClosed:
+		return "lid closed"
+	case ReasonWrapped:
+		return "hinge wrapped past 360 while already folded"
+	case ReasonStartupFolded:
+		return "started with the hinge folded past 360, lid open"
+	case ReasonUnreachable:
+		return "near-zero angle is not reachable from this posture"
+	case ReasonDeadBand:
+		return "hinge is inside the hysteresis dead band"
+	case ReasonAboveTablet:
+		return "hinge folded past the tablet threshold"
+	case ReasonAboveTent:
+		return "hinge folded past the tent threshold"
+	case ReasonBelowLaptop:
+		return "hinge returned below the laptop threshold"
+	case ReasonSensorLost:
+		return "sensor stopped reporting; releasing for safety"
+	default:
+		return "no reason recorded"
+	}
+}
 
 // Transition describes a committed posture change.
 type Transition struct {
@@ -270,10 +347,8 @@ type Transition struct {
 	To    Posture
 	Angle float64
 
-	// Reason is a short human-readable explanation, for logs and for
-	// `hinged doctor`. "Why did my keyboard just switch off" is the question
-	// this project exists to answer, so every transition carries an answer.
-	Reason string
+	// Reason explains the change.
+	Reason Reason
 
 	// SwitchChanged reports whether SW_TABLET_MODE changes value here. Posture
 	// can change without the switch changing (tent to tablet), and a uinput
@@ -297,12 +372,12 @@ func normalize(a float64) float64 {
 //
 // It returns PostureUnknown to mean "no opinion, hold what you have", which is
 // distinct from any committed answer.
-func classify(angle float64, lidClosed *bool, current Posture, c Config) (Posture, string) {
+func classify(angle float64, lidClosed OptBool, current Posture, c Config) (Posture, Reason) {
 	// A shut lid settles the question at any angle. Checked first and
 	// unconditionally: a folded-then-closed machine reports a stale or
 	// meaningless hinge angle, and must not keep the keyboard suppressed.
-	if lidClosed != nil && *lidClosed {
-		return PostureClosed, "lid closed"
+	if lidClosed.IsClosed() {
+		return PostureClosed, ReasonLidClosed
 	}
 
 	if angle < c.WrapGuard {
@@ -311,7 +386,7 @@ func classify(angle float64, lidClosed *bool, current Posture, c Config) (Postur
 		// tablet first, so the committed posture is a sufficient discriminator
 		// and no guessing is required.
 		if current == PostureTent || current == PostureTablet {
-			return PostureTablet, "hinge wrapped past 360 while already folded"
+			return PostureTablet, ReasonWrapped
 		}
 		// At startup there is no committed posture to reason from, so a machine
 		// booted or restarted while already folded would otherwise never reach
@@ -319,8 +394,8 @@ func classify(angle float64, lidClosed *bool, current Posture, c Config) (Postur
 		// cannot be shut, so a sustained near-zero angle is a genuine fold.
 		// AmbiguousSamples still gates the commit, which is what separates a
 		// real fold from a one-sample glitch.
-		if current == PostureUnknown && lidClosed != nil && !*lidClosed {
-			return PostureTablet, "started with the hinge folded past 360, lid open"
+		if current == PostureUnknown && lidClosed.IsOpen() {
+			return PostureTablet, ReasonStartupFolded
 		}
 		// From laptop posture this is always a glitch, never a fold. The hinge
 		// cannot travel from the laptop band to a wrapped near-zero without
@@ -330,20 +405,20 @@ func classify(angle float64, lidClosed *bool, current Posture, c Config) (Postur
 		// With the lid state unknown it is undecidable in either direction, and
 		// guessing wrong would either suppress the keyboard on wake or switch it
 		// off at random. Hold in both cases.
-		return PostureUnknown, "near-zero angle is not reachable from this posture"
+		return PostureUnknown, ReasonUnreachable
 	}
 
 	switch {
 	case angle >= c.TabletMin:
-		return PostureTablet, "hinge folded past the tablet threshold"
+		return PostureTablet, ReasonAboveTablet
 	case angle >= c.TentMin:
-		return PostureTent, "hinge folded past the tent threshold"
+		return PostureTent, ReasonAboveTent
 	case angle <= c.LaptopMax:
-		return PostureLaptop, "hinge returned below the laptop threshold"
+		return PostureLaptop, ReasonBelowLaptop
 	default:
 		// The hysteresis dead band. Deliberately no opinion: without it the
 		// posture flaps while the hinge rests near a threshold.
-		return PostureUnknown, "hinge is inside the hysteresis dead band"
+		return PostureUnknown, ReasonDeadBand
 	}
 }
 
@@ -362,21 +437,21 @@ func enterSamplesFor(ambiguous bool, c Config) int {
 // Step never blocks, sleeps, allocates unboundedly, or performs I/O. Callers
 // own the polling loop and the clock, which is what makes the entire decision
 // path testable without hardware.
-func Step(s State, r Reading, c Config) (State, *Transition) {
+func Step(s State, r Reading, c Config) (State, Transition, bool) {
 	// An unusable config cannot be acted on safely. Holding is always
 	// available and never disables anyone's keyboard.
 	if c.Validate() != nil {
-		return s, nil
+		return s, Transition{}, false
 	}
 
 	// An untrusted reading carries no information. Hold posture and debounce
 	// progress alike, and do not disturb the plausibility baseline.
-	if !r.Trusted || r.Angle == nil {
-		return s, nil
+	if !r.Trusted || !r.HasAngle {
+		return s, Transition{}, false
 	}
-	angle := *r.Angle
+	angle := r.Angle
 	if math.IsNaN(angle) || math.IsInf(angle, 0) {
-		return s, nil
+		return s, Transition{}, false
 	}
 	angle = normalize(angle)
 
@@ -384,34 +459,34 @@ func Step(s State, r Reading, c Config) (State, *Transition) {
 	// only safe response: treating it as valid would permanently disable every
 	// time-based check with no diagnostic.
 	if r.At.IsZero() {
-		return s, nil
+		return s, Transition{}, false
 	}
 
-	if s.lastAngle != nil && !s.lastAt.IsZero() {
+	if s.hasLast && !s.lastAt.IsZero() {
 		dt := r.At.Sub(s.lastAt)
 		switch {
 		case dt <= 0:
 			// Time did not advance. Rejected rather than allowed through,
 			// because a backwards clock would otherwise bypass every
 			// plausibility check and assert on a single reading.
-			return s, nil
+			return s, Transition{}, false
 
 		case c.StaleAfter > 0 && dt > c.StaleAfter:
 			// Too long since the last reading for it to be a useful reference.
 			// Re-baseline and demand corroboration before asserting.
-			s.lastAngle, s.lastAt = &angle, r.At
+			s.lastAngle, s.hasLast, s.lastAt = angle, true, r.At
 			s.rejectScore, s.ambiguous = 0, true
-			return s, nil
+			return s, Transition{}, false
 
 		default:
-			if implausible(angle, *s.lastAngle, dt, c) {
+			if implausible(angle, s.lastAngle, dt, c) {
 				s.rejectScore++
 				if s.rejectScore < c.RejectTolerance {
 					// Hold the old baseline. Adopting a rejected value
 					// immediately is what would let any glitch repeated twice
 					// through the filter.
 					s.lastAt = r.At
-					return s, nil
+					return s, Transition{}, false
 				}
 				// The sensor has disagreed with our reference often enough
 				// that the reference, not the sensor, is what to distrust.
@@ -428,21 +503,21 @@ func Step(s State, r Reading, c Config) (State, *Transition) {
 		s.ambiguous = true
 	}
 
-	s.lastAngle, s.lastAt = &angle, r.At
+	s.lastAngle, s.hasLast, s.lastAt = angle, true, r.At
 
-	target, reason := classify(angle, r.LidClosed, s.Posture, c)
+	target, reason := classify(angle, r.LidClosed, s.posture, c)
 
 	// No opinion. Hold posture and preserve debounce progress: an undecidable
 	// reading is not evidence against the candidate, and discarding progress
 	// here biases towards leaving the keyboard disabled.
 	if target == PostureUnknown {
-		return s, nil
+		return s, Transition{}, false
 	}
 
 	// Accumulate evidence for releasing the switch separately from the
 	// candidate counter, so that a sensor alternating between two asserting
 	// postures cannot starve the release path indefinitely.
-	if s.Posture.TabletSwitch() {
+	if s.posture.TabletSwitch() {
 		if target.TabletSwitch() {
 			s.leaveEvidence = math.Max(0, s.leaveEvidence-c.LeaveDecay)
 		} else {
@@ -452,10 +527,10 @@ func Step(s State, r Reading, c Config) (State, *Transition) {
 		s.leaveEvidence = 0
 	}
 
-	if target == s.Posture {
+	if target == s.posture {
 		s.candidate, s.samples = PostureUnknown, 0
 		s.ambiguous = false
-		return s, nil
+		return s, Transition{}, false
 	}
 
 	if target == s.candidate {
@@ -465,31 +540,104 @@ func Step(s State, r Reading, c Config) (State, *Transition) {
 	}
 
 	if !s.enough(target, c) {
-		return s, nil
+		return s, Transition{}, false
 	}
 
-	from := s.Posture
-	s.Posture = target
+	from := s.posture
+	s.posture = target
 	s.candidate, s.samples = PostureUnknown, 0
 	s.leaveEvidence = 0
 	s.ambiguous = false
 
-	return s, &Transition{
+	return s, Transition{
 		From:          from,
 		To:            target,
 		Angle:         angle,
 		Reason:        reason,
 		SwitchChanged: from.TabletSwitch() != target.TabletSwitch(),
-	}
+	}, true
 }
+
+// Tick advances time without a reading, and is how the switch gets released
+// when the sensor stops answering.
+//
+// This is the dead-man path. Without it, a sensor that wedges while tablet
+// mode is asserted leaves the keyboard suppressed indefinitely, because Step
+// is only ever called when there is something to report. Releasing must never
+// depend on the sensor's cooperation.
+//
+// Callers should invoke this on a timer regardless of read success, and
+// especially on the read-error path.
+func Tick(s State, now time.Time, c Config) (State, Transition, bool) {
+	if c.Validate() != nil || c.SensorLostGrace <= 0 {
+		return s, Transition{}, false
+	}
+	if !s.posture.TabletSwitch() || s.lastAt.IsZero() {
+		return s, Transition{}, false
+	}
+	if now.Sub(s.lastAt) < c.SensorLostGrace {
+		return s, Transition{}, false
+	}
+	from := s.posture
+	s.posture = PostureLaptop
+	s.candidate, s.samples, s.leaveEvidence = PostureUnknown, 0, 0
+	s.ambiguous, s.hasLast, s.rejectScore = true, false, 0
+	return s, Transition{
+		From:          from,
+		To:            PostureLaptop,
+		Reason:        ReasonSensorLost,
+		SwitchChanged: true,
+	}, true
+}
+
+// Engine wraps the pure state machine with a validated config, so that
+// misconfiguration is an error the caller must handle at construction rather
+// than a silent no-op on every sample.
+type Engine struct {
+	cfg   Config
+	state State
+}
+
+// New returns an Engine, or an error describing why the config is unusable.
+func New(c Config) (*Engine, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return &Engine{cfg: c}, nil
+}
+
+// Step advances the engine by one reading.
+func (e *Engine) Step(r Reading) (Transition, bool) {
+	var tr Transition
+	var ok bool
+	e.state, tr, ok = Step(e.state, r, e.cfg)
+	return tr, ok
+}
+
+// Tick advances the engine's clock without a reading.
+func (e *Engine) Tick(now time.Time) (Transition, bool) {
+	var tr Transition
+	var ok bool
+	e.state, tr, ok = Tick(e.state, now, e.cfg)
+	return tr, ok
+}
+
+// Posture returns the currently committed posture.
+func (e *Engine) Posture() Posture { return e.state.posture }
+
+// Rejected returns accumulated rejection evidence against the sensor baseline.
+func (e *Engine) Rejected() float64 { return e.state.rejectScore }
+
+// Config returns the validated configuration in use.
+func (e *Engine) Config() Config { return e.cfg }
 
 // enough reports whether the accumulated evidence justifies committing target.
 func (s State) enough(target Posture, c Config) bool {
 	switch {
-	case target.TabletSwitch() && !s.Posture.TabletSwitch():
+	case target.TabletSwitch() && !s.posture.TabletSwitch():
 		// Asserting: the dangerous direction. Ambiguous evidence needs more.
 		return s.samples >= enterSamplesFor(s.ambiguous, c)
-	case !target.TabletSwitch() && s.Posture.TabletSwitch():
+	case !target.TabletSwitch() && s.posture.TabletSwitch():
 		// Releasing: the safe direction, driven by accumulated evidence.
 		return s.leaveEvidence >= c.LeaveSamples
 	default:

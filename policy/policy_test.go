@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-func ptr[T any](v T) *T { return &v }
-
 // pollPeriod is the real polling interval on the reference hardware, derived
 // from the sensor's advertised 10 Hz. Tests use it by default so that the
 // plausibility gates are exercised at the cadence they will actually see.
@@ -19,7 +17,7 @@ const pollPeriod = 50 * time.Millisecond
 // Cadence matters: the slew gate compares angular change against elapsed time,
 // so the same sequence can be plausible when sampled slowly and implausible
 // when sampled quickly.
-func feedAt(t *testing.T, s State, c Config, lid *bool, every time.Duration, angles ...float64) (State, []Transition) {
+func feedAt(t *testing.T, s State, c Config, lid OptBool, every time.Duration, angles ...float64) (State, []Transition) {
 	t.Helper()
 	var out []Transition
 	// Continue the timeline from wherever the state left off, so chained calls
@@ -31,17 +29,18 @@ func feedAt(t *testing.T, s State, c Config, lid *bool, every time.Duration, ang
 	}
 	for _, a := range angles {
 		at = at.Add(every)
-		var tr *Transition
-		s, tr = Step(s, Reading{Angle: ptr(a), LidClosed: lid, Trusted: true, At: at}, c)
-		if tr != nil {
-			out = append(out, *tr)
+		var tr Transition
+		var ok bool
+		s, tr, ok = Step(s, Reading{Angle: a, HasAngle: true, LidClosed: lid, Trusted: true, At: at}, c)
+		if ok {
+			out = append(out, tr)
 		}
 	}
 	return s, out
 }
 
 // feed uses the real polling cadence.
-func feed(t *testing.T, s State, c Config, lid *bool, angles ...float64) (State, []Transition) {
+func feed(t *testing.T, s State, c Config, lid OptBool, angles ...float64) (State, []Transition) {
 	t.Helper()
 	return feedAt(t, s, c, lid, pollPeriod, angles...)
 }
@@ -65,11 +64,33 @@ func ramp(from, to float64, step float64) []float64 {
 
 // settle drives the machine to a posture the way the hardware would, then
 // confirms it got there.
-func settle(t *testing.T, s State, c Config, lid *bool, from, to float64) State {
+func settle(t *testing.T, s State, c Config, lid OptBool, from, to float64) State {
 	t.Helper()
 	s, _ = feed(t, s, c, lid, ramp(from, to, 20)...)
 	// Hold steady so any pending debounce completes.
 	s, _ = feed(t, s, c, lid, to, to, to, to)
+	return s
+}
+
+// stateAt drives the machine into a posture through real readings, since
+// State's posture is no longer settable from outside the package.
+func stateAt(p Posture) State {
+	c := DefaultConfig()
+	var angle float64
+	switch p {
+	case PostureLaptop:
+		angle = 110
+	case PostureTent:
+		angle = 250
+	case PostureTablet:
+		angle = 330
+	}
+	s := State{}
+	at := time.Unix(1000, 0)
+	for i := 0; i < 8; i++ {
+		at = at.Add(pollPeriod)
+		s, _, _ = Step(s, Reading{Angle: angle, HasAngle: true, LidClosed: Bool(false), Trusted: true, At: at}, c)
+	}
 	return s
 }
 
@@ -123,8 +144,8 @@ func TestConfigValidateRejectsBadConfigs(t *testing.T) {
 func TestStepRefusesInvalidConfig(t *testing.T) {
 	bad := DefaultConfig()
 	bad.TentMin = bad.TabletMin
-	s, tr := Step(State{}, Reading{Angle: ptr(250.0), Trusted: true, At: time.Unix(1, 0)}, bad)
-	if tr != nil || s.Posture != PostureUnknown {
+	s, _, ok := Step(State{}, Reading{Angle: 250.0, HasAngle: true, Trusted: true, At: time.Unix(1, 0)}, bad)
+	if ok || s.Posture() != PostureUnknown {
 		t.Error("Step acted on an invalid config")
 	}
 }
@@ -134,31 +155,31 @@ func TestClassifyBands(t *testing.T) {
 	tests := []struct {
 		name    string
 		angle   float64
-		lid     *bool
+		lid     OptBool
 		current Posture
 		want    Posture
 	}{
 		// A near-zero angle is not decidable from the angle alone.
-		{"wrapped while already folded", 5, ptr(false), PostureTablet, PostureTablet},
-		{"wrapped while in tent", 5, ptr(false), PostureTent, PostureTablet},
-		{"near-zero from laptop holds", 5, ptr(false), PostureLaptop, PostureUnknown},
-		{"near-zero at startup holds without lid state", 5, nil, PostureUnknown, PostureUnknown},
-		{"near-zero at startup with lid open is a fold", 5, ptr(false), PostureUnknown, PostureTablet},
-		{"near-zero with lid shut is closed", 5, ptr(true), PostureLaptop, PostureClosed},
+		{"wrapped while already folded", 5, Bool(false), PostureTablet, PostureTablet},
+		{"wrapped while in tent", 5, Bool(false), PostureTent, PostureTablet},
+		{"near-zero from laptop holds", 5, Bool(false), PostureLaptop, PostureUnknown},
+		{"near-zero at startup holds without lid state", 5, OptBool{}, PostureUnknown, PostureUnknown},
+		{"near-zero at startup with lid open is a fold", 5, Bool(false), PostureUnknown, PostureTablet},
+		{"near-zero with lid shut is closed", 5, Bool(true), PostureLaptop, PostureClosed},
 
 		// A shut lid settles it at any angle, not just near zero.
-		{"lid shut at tent angle", 250, ptr(true), PostureTent, PostureClosed},
-		{"lid shut at tablet angle", 330, ptr(true), PostureTablet, PostureClosed},
-		{"lid shut at laptop angle", 100, ptr(true), PostureLaptop, PostureClosed},
+		{"lid shut at tent angle", 250, Bool(true), PostureTent, PostureClosed},
+		{"lid shut at tablet angle", 330, Bool(true), PostureTablet, PostureClosed},
+		{"lid shut at laptop angle", 100, Bool(true), PostureLaptop, PostureClosed},
 
-		{"exactly at wrap guard is laptop", 30, ptr(false), PostureLaptop, PostureLaptop},
-		{"normal laptop use", 100, ptr(false), PostureLaptop, PostureLaptop},
-		{"exactly at laptop max", 180, ptr(false), PostureLaptop, PostureLaptop},
-		{"dead band lower edge", 180.1, ptr(false), PostureLaptop, PostureUnknown},
-		{"dead band upper edge", 209.9, ptr(false), PostureLaptop, PostureUnknown},
-		{"exactly at tent min", 210, ptr(false), PostureLaptop, PostureTent},
-		{"just below tablet min", 299.9, ptr(false), PostureTent, PostureTent},
-		{"exactly at tablet min", 300, ptr(false), PostureTent, PostureTablet},
+		{"exactly at wrap guard is laptop", 30, Bool(false), PostureLaptop, PostureLaptop},
+		{"normal laptop use", 100, Bool(false), PostureLaptop, PostureLaptop},
+		{"exactly at laptop max", 180, Bool(false), PostureLaptop, PostureLaptop},
+		{"dead band lower edge", 180.1, Bool(false), PostureLaptop, PostureUnknown},
+		{"dead band upper edge", 209.9, Bool(false), PostureLaptop, PostureUnknown},
+		{"exactly at tent min", 210, Bool(false), PostureLaptop, PostureTent},
+		{"just below tablet min", 299.9, Bool(false), PostureTent, PostureTent},
+		{"exactly at tablet min", 300, Bool(false), PostureTent, PostureTablet},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -166,7 +187,7 @@ func TestClassifyBands(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("classify(%v, lid, %v) = %v, want %v", tc.angle, tc.current, got, tc.want)
 			}
-			if reason == "" {
+			if reason == ReasonNone {
 				t.Error("classify must always explain itself")
 			}
 		})
@@ -203,13 +224,13 @@ func TestPostureStrings(t *testing.T) {
 // A single spurious zero must not assert. This is the documented driver glitch.
 func TestSingleSpuriousZeroDoesNotAssert(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
-	s, trs := feed(t, s, c, ptr(false), 110, 0, 110, 110, 0, 110)
+	s := settle(t, State{}, c, Bool(false), 110, 110)
+	s, trs := feed(t, s, c, Bool(false), 110, 0, 110, 110, 0, 110)
 	if len(trs) != 0 {
 		t.Errorf("spurious zeros produced %d transitions: %+v", len(trs), trs)
 	}
-	if s.Posture != PostureLaptop {
-		t.Errorf("posture = %v, want laptop", s.Posture)
+	if s.Posture() != PostureLaptop {
+		t.Errorf("posture = %v, want laptop", s.Posture())
 	}
 }
 
@@ -218,10 +239,10 @@ func TestSingleSpuriousZeroDoesNotAssert(t *testing.T) {
 // accepted -- turning the glitch filter into a glitch amplifier.
 func TestTwoConsecutiveGlitchesDoNotAssert(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
-	s, trs := feed(t, s, c, ptr(false), 0, 0)
-	if len(trs) != 0 || s.Posture != PostureLaptop {
-		t.Errorf("two glitches changed posture to %v with %d transitions", s.Posture, len(trs))
+	s := settle(t, State{}, c, Bool(false), 110, 110)
+	s, trs := feed(t, s, c, Bool(false), 0, 0)
+	if len(trs) != 0 || s.Posture() != PostureLaptop {
+		t.Errorf("two glitches changed posture to %v with %d transitions", s.Posture(), len(trs))
 	}
 }
 
@@ -229,16 +250,16 @@ func TestTwoConsecutiveGlitchesDoNotAssert(t *testing.T) {
 // cannot reach a wrapped near-zero reading without travelling through tent.
 func TestSustainedZerosFromLaptopNeverAssert(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
+	s := settle(t, State{}, c, Bool(false), 110, 110)
 	zeros := make([]float64, 50)
-	s, trs := feed(t, s, c, ptr(false), zeros...)
+	s, trs := feed(t, s, c, Bool(false), zeros...)
 	for _, tr := range trs {
 		if tr.To.TabletSwitch() {
 			t.Fatalf("a run of zeros asserted the switch: %+v", tr)
 		}
 	}
-	if s.Posture != PostureLaptop {
-		t.Errorf("posture = %v, want laptop held", s.Posture)
+	if s.Posture() != PostureLaptop {
+		t.Errorf("posture = %v, want laptop held", s.Posture())
 	}
 }
 
@@ -247,29 +268,28 @@ func TestSustainedZerosFromLaptopNeverAssert(t *testing.T) {
 // corroboration is what keeps a one-sample glitch from taking the same path.
 func TestBootedFoldedReachesTablet(t *testing.T) {
 	c := DefaultConfig()
-	s, _ := feed(t, State{}, c, ptr(false), 5, 5, 5, 5, 5, 5)
-	if s.Posture != PostureTablet {
-		t.Errorf("posture = %v, want tablet when started already folded", s.Posture)
+	s, _ := feed(t, State{}, c, Bool(false), 5, 5, 5, 5, 5, 5)
+	if s.Posture() != PostureTablet {
+		t.Errorf("posture = %v, want tablet when started already folded", s.Posture())
 	}
 }
 
 // The same startup path must not commit on a single glitch.
 func TestBootGlitchDoesNotAssertAlone(t *testing.T) {
 	c := DefaultConfig()
-	s, trs := feed(t, State{}, c, ptr(false), 0)
+	_, trs := feed(t, State{}, c, Bool(false), 0)
 	for _, tr := range trs {
 		if tr.To.TabletSwitch() {
 			t.Fatalf("one startup zero asserted: %+v", tr)
 		}
 	}
-	_ = s
 }
 
 // A one-degree movement across the wrap guard must not disable the keyboard.
 func TestSmallMovementAcrossWrapGuardDoesNotAssert(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 100, 31)
-	s, trs := feed(t, s, c, ptr(false), 30.5, 29.5, 29, 28.5, 29)
+	s := settle(t, State{}, c, Bool(false), 100, 31)
+	_, trs := feed(t, s, c, Bool(false), 30.5, 29.5, 29, 28.5, 29)
 	for _, tr := range trs {
 		if tr.To.TabletSwitch() {
 			t.Fatalf("a 1 degree move asserted the switch: %+v", tr)
@@ -281,19 +301,19 @@ func TestSmallMovementAcrossWrapGuardDoesNotAssert(t *testing.T) {
 // in four hundred would otherwise boot straight into tablet mode.
 func TestFirstReadingDoesNotAssertAlone(t *testing.T) {
 	c := DefaultConfig()
-	s, trs := feed(t, State{}, c, ptr(false), 330)
+	s, trs := feed(t, State{}, c, Bool(false), 330)
 	for _, tr := range trs {
 		if tr.To.TabletSwitch() {
 			t.Fatalf("first reading asserted: %+v", tr)
 		}
 	}
-	if s.Posture.TabletSwitch() {
-		t.Errorf("posture = %v after one reading", s.Posture)
+	if s.Posture().TabletSwitch() {
+		t.Errorf("posture = %v after one reading", s.Posture())
 	}
 	// It should assert once corroborated.
-	s, _ = feed(t, s, c, ptr(false), 330, 330, 330)
-	if !s.Posture.TabletSwitch() {
-		t.Errorf("posture = %v, want an asserting posture after corroboration", s.Posture)
+	s, _ = feed(t, s, c, Bool(false), 330, 330, 330)
+	if !s.Posture().TabletSwitch() {
+		t.Errorf("posture = %v, want an asserting posture after corroboration", s.Posture())
 	}
 }
 
@@ -301,10 +321,10 @@ func TestFirstReadingDoesNotAssertAlone(t *testing.T) {
 func TestClosedLidNeverAsserts(t *testing.T) {
 	c := DefaultConfig()
 	for _, angle := range []float64{0, 5, 100, 200, 250, 330, 359} {
-		s := State{Posture: PostureLaptop}
-		s, _ = feed(t, s, c, ptr(true), angle, angle, angle, angle, angle)
-		if s.Posture.TabletSwitch() {
-			t.Errorf("angle %v with lid shut gave %v, which asserts", angle, s.Posture)
+		s := stateAt(PostureLaptop)
+		s, _ = feed(t, s, c, Bool(true), angle, angle, angle, angle, angle)
+		if s.Posture().TabletSwitch() {
+			t.Errorf("angle %v with lid shut gave %v, which asserts", angle, s.Posture())
 		}
 	}
 }
@@ -313,12 +333,12 @@ func TestClosedLidNeverAsserts(t *testing.T) {
 func TestBackwardsClockIsRejected(t *testing.T) {
 	c := DefaultConfig()
 	base := time.Unix(1000, 0)
-	s := settle(t, State{}, c, ptr(false), 110, 110)
+	s := settle(t, State{}, c, Bool(false), 110, 110)
 	for i := 0; i < 10; i++ {
-		s, _ = Step(s, Reading{Angle: ptr(0.0), Trusted: true, At: base}, c)
+		s, _, _ = Step(s, Reading{Angle: 0.0, HasAngle: true, Trusted: true, At: base}, c)
 	}
-	if s.Posture.TabletSwitch() {
-		t.Errorf("posture = %v after backwards-clock readings", s.Posture)
+	if s.Posture().TabletSwitch() {
+		t.Errorf("posture = %v after backwards-clock readings", s.Posture())
 	}
 }
 
@@ -326,8 +346,8 @@ func TestBackwardsClockIsRejected(t *testing.T) {
 // permanently disable every time-based check with no diagnostic.
 func TestZeroTimestampIsRejected(t *testing.T) {
 	c := DefaultConfig()
-	s, tr := Step(State{}, Reading{Angle: ptr(330.0), Trusted: true}, c)
-	if tr != nil || s.Posture != PostureUnknown {
+	s, _, ok := Step(State{}, Reading{Angle: 330.0, HasAngle: true, Trusted: true}, c)
+	if ok || s.Posture() != PostureUnknown {
 		t.Error("a reading with no timestamp must change nothing")
 	}
 }
@@ -335,10 +355,11 @@ func TestZeroTimestampIsRejected(t *testing.T) {
 func TestNonFiniteAnglesAreRejected(t *testing.T) {
 	c := DefaultConfig()
 	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		s := State{Posture: PostureLaptop}
-		before := s
-		s, tr := Step(s, Reading{Angle: ptr(bad), Trusted: true, At: time.Unix(1, 0)}, c)
-		if tr != nil || s.Posture != before.Posture {
+		s := stateAt(PostureLaptop)
+		before := s.Posture()
+		at := s.lastAt.Add(pollPeriod)
+		s, _, ok := Step(s, Reading{Angle: bad, HasAngle: true, Trusted: true, At: at}, c)
+		if ok || s.Posture() != before {
 			t.Errorf("angle %v changed state", bad)
 		}
 	}
@@ -348,9 +369,9 @@ func TestNonFiniteAnglesAreRejected(t *testing.T) {
 // would otherwise make the switch impossible to release.
 func TestNaNPreservesLeaveProgress(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 330)
-	if !s.Posture.TabletSwitch() {
-		t.Fatalf("setup: %v", s.Posture)
+	s := settle(t, State{}, c, Bool(false), 110, 330)
+	if !s.Posture().TabletSwitch() {
+		t.Fatalf("setup: %v", s.Posture())
 	}
 	at := s.lastAt
 	for i := 0; i < 12; i++ {
@@ -359,9 +380,9 @@ func TestNaNPreservesLeaveProgress(t *testing.T) {
 		if i%2 == 1 {
 			angle = math.NaN()
 		}
-		s, _ = Step(s, Reading{Angle: ptr(angle), LidClosed: ptr(false), Trusted: true, At: at}, c)
+		s, _, _ = Step(s, Reading{Angle: angle, HasAngle: true, LidClosed: Bool(false), Trusted: true, At: at}, c)
 	}
-	if s.Posture.TabletSwitch() {
+	if s.Posture().TabletSwitch() {
 		t.Error("interleaved NaNs prevented the switch from releasing")
 	}
 }
@@ -421,11 +442,11 @@ func TestSlewGateCeilingIsHonest(t *testing.T) {
 func TestWrapGuardProtectsSlowSensorsAlone(t *testing.T) {
 	c := DefaultConfig()
 	slow := 2 * SlewGateCeiling(c)
-	s, _ := feedAt(t, State{}, c, ptr(false), slow, 110, 110, 110, 110)
-	if s.Posture != PostureLaptop {
-		t.Fatalf("setup: %v", s.Posture)
+	s, _ := feedAt(t, State{}, c, Bool(false), slow, 110, 110, 110, 110)
+	if s.Posture() != PostureLaptop {
+		t.Fatalf("setup: %v", s.Posture())
 	}
-	_, trs := feedAt(t, s, c, ptr(false), slow, 0, 0, 0, 0, 0, 0)
+	_, trs := feedAt(t, s, c, Bool(false), slow, 0, 0, 0, 0, 0, 0)
 	for _, tr := range trs {
 		if tr.To.TabletSwitch() {
 			t.Fatalf("zeros asserted on a slow sensor with no slew gate: %+v", tr)
@@ -437,22 +458,22 @@ func TestWrapGuardProtectsSlowSensorsAlone(t *testing.T) {
 // would be rejected forever.
 func TestPersistentMovementIsEventuallyAccepted(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
+	s := settle(t, State{}, c, Bool(false), 110, 110)
 	// A jump larger than the step cap, held steady.
 	held := make([]float64, 12)
 	for i := range held {
 		held[i] = 330
 	}
-	s, _ = feed(t, s, c, ptr(false), held...)
-	if s.Posture != PostureTablet {
-		t.Errorf("posture = %v, want tablet once the movement proved persistent", s.Posture)
+	s, _ = feed(t, s, c, Bool(false), held...)
+	if s.Posture() != PostureTablet {
+		t.Errorf("posture = %v, want tablet once the movement proved persistent", s.Posture())
 	}
 }
 
 func TestRejectedReadingsAreObservable(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
-	s, _ = feed(t, s, c, ptr(false), 0)
+	s := settle(t, State{}, c, Bool(false), 110, 110)
+	s, _ = feed(t, s, c, Bool(false), 0)
 	if s.Rejected() == 0 {
 		t.Error("a rejected reading must be visible to the caller, so that " +
 			"'every reading is being discarded' is distinguishable from 'the sensor is idle'")
@@ -463,13 +484,13 @@ func TestRejectedReadingsAreObservable(t *testing.T) {
 
 func TestDeadBandNeverFlaps(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 100, 100)
-	s, trs := feed(t, s, c, ptr(false), 181, 190, 200, 209, 195, 185, 205, 199, 182, 208)
+	s := settle(t, State{}, c, Bool(false), 100, 100)
+	s, trs := feed(t, s, c, Bool(false), 181, 190, 200, 209, 195, 185, 205, 199, 182, 208)
 	if len(trs) != 0 {
 		t.Errorf("dead band produced %d transitions: %+v", len(trs), trs)
 	}
-	if s.Posture != PostureLaptop {
-		t.Errorf("posture = %v, want laptop held", s.Posture)
+	if s.Posture() != PostureLaptop {
+		t.Errorf("posture = %v, want laptop held", s.Posture())
 	}
 }
 
@@ -477,21 +498,21 @@ func TestDeadBandNeverFlaps(t *testing.T) {
 // between postures would otherwise keep the keyboard disabled forever.
 func TestAlternatingSensorStillReleases(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 250)
-	if !s.Posture.TabletSwitch() {
-		t.Fatalf("setup: %v", s.Posture)
+	s := settle(t, State{}, c, Bool(false), 110, 250)
+	if !s.Posture().TabletSwitch() {
+		t.Fatalf("setup: %v", s.Posture())
 	}
 
 	at := s.lastAt
-	for i := 0; i < 60 && s.Posture.TabletSwitch(); i++ {
+	for i := 0; i < 60 && s.Posture().TabletSwitch(); i++ {
 		at = at.Add(pollPeriod)
 		angle := 250.0
 		if i%2 == 0 {
 			angle = 100
 		}
-		s, _ = Step(s, Reading{Angle: ptr(angle), LidClosed: ptr(false), Trusted: true, At: at}, c)
+		s, _, _ = Step(s, Reading{Angle: angle, HasAngle: true, LidClosed: Bool(false), Trusted: true, At: at}, c)
 	}
-	if s.Posture.TabletSwitch() {
+	if s.Posture().TabletSwitch() {
 		t.Error("a sensor disagreeing half the time kept the switch asserted indefinitely")
 	}
 }
@@ -500,13 +521,13 @@ func TestAlternatingSensorStillReleases(t *testing.T) {
 func TestFullFoldCycleIsClean(t *testing.T) {
 	c := DefaultConfig()
 	var trs []Transition
-	s, a := feed(t, State{}, c, ptr(false), ramp(95, 355, 15)...)
+	s, a := feed(t, State{}, c, Bool(false), ramp(95, 355, 15)...)
 	trs = append(trs, a...)
-	s, b := feed(t, s, c, ptr(false), 355, 355, 355)
+	s, b := feed(t, s, c, Bool(false), 355, 355, 355)
 	trs = append(trs, b...)
-	s, d := feed(t, s, c, ptr(false), ramp(355, 95, 15)...)
+	s, d := feed(t, s, c, Bool(false), ramp(355, 95, 15)...)
 	trs = append(trs, d...)
-	s, e := feed(t, s, c, ptr(false), 95, 95, 95, 95)
+	s, e := feed(t, s, c, Bool(false), 95, 95, 95, 95)
 	trs = append(trs, e...)
 
 	var asserts, releases int
@@ -526,19 +547,19 @@ func TestFullFoldCycleIsClean(t *testing.T) {
 	if releases != 1 {
 		t.Errorf("switch released %d times, want 1 (%+v)", releases, trs)
 	}
-	if s.Posture != PostureLaptop {
-		t.Errorf("final posture = %v, want laptop", s.Posture)
+	if s.Posture() != PostureLaptop {
+		t.Errorf("final posture = %v, want laptop", s.Posture())
 	}
 }
 
 // tent -> tablet is a real posture change that must not toggle the switch.
 func TestPostureChangeWithoutSwitchChange(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 250)
-	if s.Posture != PostureTent {
-		t.Fatalf("setup: %v", s.Posture)
+	s := settle(t, State{}, c, Bool(false), 110, 250)
+	if s.Posture() != PostureTent {
+		t.Fatalf("setup: %v", s.Posture())
 	}
-	_, trs := feed(t, s, c, ptr(false), ramp(250, 330, 20)...)
+	_, trs := feed(t, s, c, Bool(false), ramp(250, 330, 20)...)
 	var found bool
 	for _, tr := range trs {
 		if tr.To == PostureTablet {
@@ -557,32 +578,32 @@ func TestPostureChangeWithoutSwitchChange(t *testing.T) {
 
 func TestUntrustedReadingIsInert(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
-	before := s.Posture
+	s := settle(t, State{}, c, Bool(false), 110, 110)
+	before := s.Posture()
 	at := s.lastAt.Add(pollPeriod)
-	s, tr := Step(s, Reading{Angle: ptr(330.0), Trusted: false, At: at}, c)
-	if tr != nil || s.Posture != before {
+	s, _, ok := Step(s, Reading{Angle: 330.0, HasAngle: true, Trusted: false, At: at}, c)
+	if ok || s.Posture() != before {
 		t.Error("an untrusted reading must change nothing")
 	}
 }
 
 func TestNilAngleIsInert(t *testing.T) {
 	c := DefaultConfig()
-	s := settle(t, State{}, c, ptr(false), 110, 110)
-	s, tr := Step(s, Reading{Angle: nil, Trusted: true, At: s.lastAt.Add(pollPeriod)}, c)
-	if tr != nil || s.Posture != PostureLaptop {
+	s := settle(t, State{}, c, Bool(false), 110, 110)
+	s, _, ok := Step(s, Reading{HasAngle: false, Trusted: true, At: s.lastAt.Add(pollPeriod)}, c)
+	if ok || s.Posture() != PostureLaptop {
 		t.Error("a reading with no angle must change nothing")
 	}
 }
 
 func TestTransitionsCarryDiagnostics(t *testing.T) {
 	c := DefaultConfig()
-	_, trs := feed(t, State{}, c, ptr(false), ramp(95, 355, 15)...)
+	_, trs := feed(t, State{}, c, Bool(false), ramp(95, 355, 15)...)
 	if len(trs) == 0 {
 		t.Fatal("expected transitions")
 	}
 	for _, tr := range trs {
-		if tr.Reason == "" {
+		if tr.Reason == ReasonNone {
 			t.Errorf("%v -> %v has no reason", tr.From, tr.To)
 		}
 		if tr.Angle < 0 || tr.Angle >= 360 {
@@ -593,9 +614,9 @@ func TestTransitionsCarryDiagnostics(t *testing.T) {
 
 func TestZeroStateIsUsable(t *testing.T) {
 	c := DefaultConfig()
-	s, _ := feed(t, State{}, c, ptr(false), 100, 100)
-	if s.Posture != PostureLaptop {
-		t.Errorf("posture = %v, want laptop", s.Posture)
+	s, _ := feed(t, State{}, c, Bool(false), 100, 100)
+	if s.Posture() != PostureLaptop {
+		t.Errorf("posture = %v, want laptop", s.Posture())
 	}
 }
 
@@ -610,15 +631,103 @@ func FuzzStep(f *testing.F) {
 		at := time.Unix(1000, 0)
 		for _, angle := range []float64{a, b, cc, d} {
 			at = at.Add(pollPeriod)
-			s, _ = Step(s, Reading{Angle: ptr(angle), LidClosed: &lidClosed, Trusted: true, At: at}, cfg)
+			s, _, _ = Step(s, Reading{Angle: angle, HasAngle: true, LidClosed: Bool(lidClosed), Trusted: true, At: at}, cfg)
 		}
 		// Sustained, plausible laptop readings must always win in the end.
 		for i := 0; i < 40; i++ {
 			at = at.Add(pollPeriod)
-			s, _ = Step(s, Reading{Angle: ptr(100.0), LidClosed: ptr(false), Trusted: true, At: at}, cfg)
+			s, _, _ = Step(s, Reading{Angle: 100.0, HasAngle: true, LidClosed: Bool(false), Trusted: true, At: at}, cfg)
 		}
-		if s.Posture.TabletSwitch() {
-			t.Errorf("switch still asserted after 40 laptop readings: %v", s.Posture)
+		if s.Posture().TabletSwitch() {
+			t.Errorf("switch still asserted after 40 laptop readings: %v", s.Posture())
 		}
 	})
+}
+
+// --- Dead-man release -------------------------------------------------------
+
+// A sensor that stops answering must not leave the keyboard suppressed. This
+// is the one release path that does not depend on the sensor's cooperation.
+func TestTickReleasesWhenSensorGoesSilent(t *testing.T) {
+	c := DefaultConfig()
+	s := settle(t, State{}, c, Bool(false), 110, 330)
+	if !s.Posture().TabletSwitch() {
+		t.Fatalf("setup: %v", s.Posture())
+	}
+
+	// Not yet: within the grace period nothing should happen.
+	s, _, ok := Tick(s, s.lastAt.Add(c.SensorLostGrace/2), c)
+	if ok {
+		t.Error("released before the grace period elapsed")
+	}
+
+	s, tr, ok := Tick(s, s.lastAt.Add(c.SensorLostGrace+time.Second), c)
+	if !ok {
+		t.Fatal("sensor went silent past the grace period and the switch was not released")
+	}
+	if tr.Reason != ReasonSensorLost || !tr.SwitchChanged {
+		t.Errorf("transition = %+v, want a sensor-lost release", tr)
+	}
+	if s.Posture().TabletSwitch() {
+		t.Errorf("posture = %v, want the switch released", s.Posture())
+	}
+}
+
+// Tick must do nothing when the switch is not asserted; there is nothing to
+// make safe, and a spurious transition would churn the logs.
+func TestTickIsInertWhenNotAsserted(t *testing.T) {
+	c := DefaultConfig()
+	s := settle(t, State{}, c, Bool(false), 110, 110)
+	if _, _, ok := Tick(s, s.lastAt.Add(time.Hour), c); ok {
+		t.Error("Tick fired while in laptop posture")
+	}
+}
+
+func TestTickDisabledByZeroGrace(t *testing.T) {
+	c := DefaultConfig()
+	c.SensorLostGrace = 0
+	s := settle(t, State{}, c, Bool(false), 110, 330)
+	if _, _, ok := Tick(s, s.lastAt.Add(time.Hour), c); ok {
+		t.Error("Tick fired with the dead-man path disabled")
+	}
+}
+
+// The Engine wrapper must reject a bad config at construction rather than
+// silently doing nothing on every sample.
+func TestEngineRejectsInvalidConfigAtConstruction(t *testing.T) {
+	bad := DefaultConfig()
+	bad.TentMin = bad.TabletMin
+	if _, err := New(bad); err == nil {
+		t.Fatal("New accepted an invalid config")
+	}
+	e, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New rejected a valid config: %v", err)
+	}
+	if e.Posture() != PostureUnknown {
+		t.Errorf("fresh engine posture = %v", e.Posture())
+	}
+}
+
+func TestReasonsAllStringify(t *testing.T) {
+	for r := ReasonNone; r <= ReasonSensorLost; r++ {
+		if r.String() == "" {
+			t.Errorf("Reason(%d) has no string", int(r))
+		}
+	}
+}
+
+// OptBool must keep "absent" distinct from "open": conflating them would make
+// a missing lid switch read as a permanently open lid.
+func TestOptBoolDistinguishesAbsentFromOpen(t *testing.T) {
+	var absent OptBool
+	if absent.IsOpen() || absent.IsClosed() {
+		t.Error("an absent lid reading is neither open nor closed")
+	}
+	if !Bool(false).IsOpen() || Bool(false).IsClosed() {
+		t.Error("Bool(false) must be open")
+	}
+	if !Bool(true).IsClosed() || Bool(true).IsOpen() {
+		t.Error("Bool(true) must be closed")
+	}
 }

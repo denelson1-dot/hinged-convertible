@@ -85,7 +85,10 @@ function with no I/O — so all of it is tested without hardware.
   rejected. This is not theoretical — see [Hardware notes](#hardware-notes).
 - **Lid override.** A shut lid and a fully folded hinge both read near zero. The
   lid switch is the only thing that distinguishes them, and a shut lid must
-  never assert tablet mode.
+  never assert tablet mode — at any angle, not just near zero.
+- **Dead-man release.** If the sensor stops answering while tablet mode is
+  asserted, the switch is released anyway. Releasing must never depend on the
+  sensor's cooperation, because a wedged sensor is exactly when it matters.
 - **Tent posture.** A hinge angle gives you states the binary switch cannot
   express. Tent asserts `SW_TABLET_MODE` (the keyboard faces away) but is
   reported distinctly over the API.
@@ -177,6 +180,27 @@ tag does nothing and the group-based alternative in the rule file applies.
 | `hinged doctor` | What this machine exposes, what's reachable, what would be used |
 | `hinged watch` | Live posture decisions, read-only, changes nothing |
 
+### Thresholds are not compiled in
+
+The defaults are calibrated for one chassis. Every threshold can be overridden,
+and an inconsistent set is rejected at startup rather than producing undefined
+posture bands:
+
+```sh
+hinged watch -enter-angle 200 -leave-angle 160 -wrap-guard 15
+```
+
+| Flag | Meaning |
+|---|---|
+| `-enter-angle` | Assert tablet mode at or above this angle (default 210) |
+| `-leave-angle` | Laptop posture at or below this angle (default 180) |
+| `-wrap-guard` | Below this, a reading may be a hinge wrapped past 360 (default 30) |
+| `-tablet-angle` | Fully folded at or above this angle (default 300) |
+| `-max-slew` | Reject change faster than this in °/s; 0 disables (default 720) |
+
+For reference, the ChromeOS EC ships 180° with 20° of hysteresis, and treats
+under 15° as closed — so other vendors do land in a different place.
+
 ## Hardware notes
 
 Findings from developing against an HP ENVY x360 15-bp1xx that may save you time
@@ -226,28 +250,44 @@ here, so polling faster than 20 Hz only re-reads unchanged values.
 - [x] Pure policy engine with hysteresis, wrap guard, debounce, slew gate
 - [x] `doctor` — permission-aware hardware probe
 - [x] `watch` — live read-only posture decisions
+- [x] Configurable thresholds
+- [x] Dead-man release when the sensor stops reporting
 - [ ] **Verify libinput honours a synthetic switch on real hardware** ← blocks everything
 - [ ] `uinput` switch synthesis, with explicit release before device destroy
-- [ ] Dead-man timer: release the switch when the sensor stops reporting
-- [ ] Configurable thresholds — currently compiled in, which is the main
-      portability limit for other chassis
 - [ ] Switch-health auditing and repair for lying firmware
 - [ ] Command hooks and D-Bus API
 - [ ] Accelerometer-pair angle derivation
 - [ ] Optional offline voice dictation module
 
+## Layout
+
+```
+policy/           the pure decision engine — importable, no I/O, no hardware
+internal/source/  IIO and evdev readers
+internal/probe/   unprivileged hardware discovery, behind `doctor`
+internal/watch/   the live loop
+cmd/hinged/       CLI
+```
+
+`policy` is deliberately **not** under `internal/`: it is the reusable part, and
+it has no dependency on anything else here.
+
 ## Testing
 
-`internal/policy` is pure and covered at ~96%, including a fuzz target. The
-hardware-facing packages (`probe`, `source`, `cmd`) currently have **no tests at
-all**, so overall statement coverage is about 17%. Most of what they do is
-string and sysfs parsing that could be tested against fixtures without hardware;
-that it is not yet is a gap, not a constraint.
+Everything decision-shaped is tested without hardware. `policy` is pure and
+covered at ~96% including a fuzz target; `source` and `probe` are tested against
+sysfs fixtures and captured `/proc/bus/input/devices` records, including a
+malicious device name that tries to forge a record.
 
 ```sh
-go test ./...                      # policy only
-go test -coverpkg=./... ./...      # honest overall number
+go test ./...
+go test -coverpkg=./... ./...      # coverage across all packages
 ```
+
+CI additionally runs `staticcheck`, `govulncheck`, `go mod tidy -diff`, and
+builds for `amd64`, `arm64`, `arm` and `386`. That matrix is not decoration:
+`sizeof(struct input_event)` differs on 32-bit, and the wrong value compiles
+cleanly everywhere while silently desynchronising the event stream.
 
 ## Prior art
 

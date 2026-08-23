@@ -1,28 +1,66 @@
 name: ci
+
 on:
   push:
     branches: [main]
   pull_request:
 
+# The workflow runs code from fork pull requests. Least privilege, and never
+# switch this trigger to pull_request_target.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
         with:
-          go-version: '1.27'
-
-      # The core must never need cgo. This is a hard requirement, not a
-      # preference: it is what makes the binary portable across distros.
-      - name: build (pure static, no cgo)
-        run: CGO_ENABLED=0 go build -trimpath ./cmd/hinged
-
-      - name: vet
-        run: go vet ./...
+          go-version-file: go.mod
 
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
+      - name: vet
+        run: go vet ./...
+
       - name: test
-        run: go test -race -cover ./...
+        run: go test -race -coverprofile=cover.out ./...
+
+      - name: coverage (honest, across all packages)
+        run: go test -coverpkg=./... -covermode=atomic ./...
+
+  # The core must never need cgo, and must be correct on 32-bit. The
+  # sizeof(struct input_event) bug was invisible until this matrix existed:
+  # it compiles clean on every architecture and is only wrong on 32-bit ones.
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64, arm, '386']
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version-file: go.mod
+      - name: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath ./cmd/hinged
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version-file: go.mod
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: module tidiness
+        run: go mod tidy -diff

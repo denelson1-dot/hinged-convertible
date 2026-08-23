@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package source reads posture signals from the kernel.
 //
 // Sources own the messiness of sysfs layouts, unit conversion and device
@@ -164,11 +166,21 @@ func OpenHinge() (*Hinge, error) {
 	if len(found) == 0 {
 		return nil, fmt.Errorf("no IIO hinge-angle sensor found")
 	}
-	h := &Hinge{info: found[0]}
-	if _, err := h.Degrees(); err != nil {
-		return nil, fmt.Errorf("hinge sensor at %s is unusable: %w", h.info.Raw, err)
+	// Try every candidate, and retry the validation read a few times. At the
+	// measured glitch rate a single bad read at startup would otherwise mean
+	// no hinge source at all until the daemon is restarted.
+	var lastErr error
+	for _, info := range found {
+		h := &Hinge{info: info}
+		for attempt := 0; attempt < 3; attempt++ {
+			if _, err := h.Degrees(); err == nil {
+				return h, nil
+			} else {
+				lastErr = err
+			}
+		}
 	}
-	return h, nil
+	return nil, fmt.Errorf("no usable hinge sensor among %d candidate(s): %w", len(found), lastErr)
 }
 
 // Info returns the discovered sensor description.
@@ -186,37 +198,50 @@ func (h *Hinge) Describe() string { return h.info.Units() }
 // readSysfsRaw reads a sysfs attribute using raw syscalls rather than the os
 // package.
 //
-// This is not premature optimisation, it is a partial correctness fix.
-//
 // Reading a HID-sensor IIO attribute triggers a round trip to the sensor hub,
 // and the driver intermittently answers 0 instead of waiting for the real
-// value. Go's os package makes this dramatically worse: it registers pollable
-// descriptors with the runtime poller and opens them non-blocking, so it takes
-// the early zero far more often.
+// value. Reading through the os package is measurably worse than issuing the
+// syscalls directly. Interleaved A/B at 20 samples/second with the hinge
+// stationary:
 //
-// Measured on an HP ENVY x360 at 20 samples/second with the hinge stationary
-// at 110 degrees:
+//	os.ReadFile        ~3%   bad reads
+//	syscall.Open+Read  ~0.3% bad reads
 //
-//	os.ReadFile        3.7%  bad reads (11 of 293)
-//	syscall.Open+Read  0.24% bad reads (1 of 418)
+// The mechanism is NOT known. An earlier version of this comment blamed
+// O_NONBLOCK and the runtime poller. That was tested and is wrong: an
+// os.NewFile wrapper around a plain blocking descriptor, never registered with
+// the poller, is affected just as badly. Something in the os.File read path is
+// responsible; this project has not identified what. The effect replicates,
+// the cause is open.
 //
-// So raw syscalls reduce the glitch rate roughly fifteen-fold but do NOT
-// eliminate it. That residue is why the policy layer treats a near-zero
-// reading as undecidable rather than as a folded hinge. Both defences are
-// required and neither is sufficient alone.
+// Raw syscalls cut the rate by roughly an order of magnitude but do not
+// eliminate it. That residue is why the policy layer refuses to read a
+// near-zero angle as a fold unless the physical path supports it. Both
+// defences are required and neither is sufficient alone.
 func readSysfsRaw(path string) (string, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
+	// O_CLOEXEC because this opens and closes at up to 20 Hz, and any exec
+	// from another goroutine during that window would otherwise inherit the
+	// descriptor. The os package always sets it; the raw path must too.
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return "", &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	defer syscall.Close(fd)
 
+	// Retry on EINTR. Go's stdlib wraps every syscall in ignoringEINTR; a raw
+	// call has to do it explicitly or a signal arriving mid-read surfaces as a
+	// spurious sensor failure.
 	var buf [64]byte
-	n, err := syscall.Read(fd, buf[:])
-	if err != nil {
-		return "", &os.PathError{Op: "read", Path: path, Err: err}
+	for {
+		n, err := syscall.Read(fd, buf[:])
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return "", &os.PathError{Op: "read", Path: path, Err: err}
+		}
+		return string(buf[:n]), nil
 	}
-	return string(buf[:n]), nil
 }
 
 // ErrUnreliable reports a reading the hardware itself has flagged as invalid,

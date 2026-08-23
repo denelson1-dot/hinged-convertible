@@ -4,8 +4,10 @@
 
 Written in Go. The core is a single static binary with no runtime dependencies.
 
-> **Status: early.** The policy engine and hardware probe work and are tested.
-> Switch synthesis is in progress. See [Roadmap](#roadmap).
+> **Status: working.** Runs as the daily driver on the reference machine.
+> Switch synthesis is verified end to end: folding suspends the internal
+> keyboard through libinput, exactly as a kernel-provided switch would.
+> See [Roadmap](#roadmap).
 
 ---
 
@@ -128,23 +130,30 @@ through libinput.
 [tp-resume]: https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-mt-touchpad.c
 [kbd-noresume]: https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-fallback.c
 
-### Does libinput even suspend the keyboard on this hardware?
+### Does libinput honour a synthetic switch? Yes — verified
 
-Possibly not. `fallback_pair_tablet_mode` refuses to pair a keyboard with a
-tablet-mode switch unless that keyboard is tagged `EVDEV_TAG_INTERNAL_KEYBOARD`,
-which comes from an `ID_INTEGRATION` udev property. On the reference machine:
+This was the project's one load-bearing unknown, since libinput's docs say
+nothing about device provenance and its model-keyed quirks imply identity can
+matter. Confirmed on the reference machine (libinput 1.25.0, kernel 7.0):
 
 ```
-$ udevadm info -q property -n /dev/input/event3 | grep -c ID_INTEGRATION
-0                                    # the AT internal keyboard: absent
-$ udevadm info -q property -n /dev/input/event8 | grep INTEGRATION
-ID_INPUT_TOUCHPAD_INTEGRATION=internal   # the touchpad: present
+Device:       hinged virtual tablet mode switch
+Kernel:       /dev/input/event19
+Capabilities: switch
 ```
 
-So a synthesized switch may suspend the touchpad and not the keyboard here.
-Confirming this with `libinput debug-events` is the first task on the roadmap,
-because it decides whether switch synthesis alone is sufficient or whether a
-direct-inhibition fallback is mandatory.
+Folding past the threshold asserted `SW_TABLET_MODE`, and **the internal
+keyboard stopped responding** until the machine was unfolded. libinput treats a
+uinput switch exactly as it treats a kernel-driver one.
+
+Worth noting because it was a live worry: that keyboard carries no
+`ID_INTEGRATION` udev property, only `ID_PATH=platform-i8042-serio-0`. libinput
+infers internal-ness from the platform bus, so ordinary laptop keyboards pair
+without needing per-machine tagging.
+
+Untested elsewhere: this is one machine, one libinput version, one input stack.
+Reports from other hardware are welcome — `hinged doctor` output is the useful
+thing to include.
 
 ## Install
 
@@ -283,8 +292,9 @@ here, so polling faster than 20 Hz only re-reads unchanged values.
 - [x] `watch` — live read-only posture decisions
 - [x] Configurable thresholds
 - [x] Dead-man release when the sensor stops reporting
-- [ ] **Verify libinput honours a synthetic switch on real hardware** ← blocks everything
-- [ ] `uinput` switch synthesis, with explicit release before device destroy
+- [x] **Verified: libinput honours a synthetic switch and suspends the keyboard**
+- [x] `uinput` switch synthesis, with explicit release before device destroy
+- [x] Daemon, hooks, config, systemd units
 - [ ] Switch-health auditing and repair for lying firmware
 - [ ] Command hooks and D-Bus API
 - [ ] Accelerometer-pair angle derivation

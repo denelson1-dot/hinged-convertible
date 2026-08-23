@@ -275,9 +275,20 @@ it has no dependency on anything else here.
 ## Testing
 
 Everything decision-shaped is tested without hardware. `policy` is pure and
-covered at ~96% including a fuzz target; `source` and `probe` are tested against
+covered at ~91% including a fuzz target; `source` and `probe` are tested against
 sysfs fixtures and captured `/proc/bus/input/devices` records, including a
 malicious device name that tries to forge a record.
+
+| Package | Coverage |
+|---|---|
+| `policy` | 91% |
+| `internal/probe` | 49% |
+| `internal/source` | 25% |
+| `internal/watch`, `cmd/hinged` | 0% |
+| **total** | **33%** |
+
+The live loop and the CLI are the untested parts. They are mostly I/O
+orchestration, but that is an explanation rather than an excuse.
 
 ```sh
 go test ./...

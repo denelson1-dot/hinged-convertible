@@ -177,8 +177,39 @@ tag does nothing and the group-based alternative in the rule file applies.
 
 | Command | |
 |---|---|
+| `hinged daemon` | Run it: synthesize the switch and fire hooks |
 | `hinged doctor` | What this machine exposes, what's reachable, what would be used |
 | `hinged watch` | Live posture decisions, read-only, changes nothing |
+| `hinged config` | Show the loaded configuration and where it came from |
+| `hinged release` | Publish `SW_TABLET_MODE=0` and exit, for recovery |
+
+`hinged daemon --dry-run` decides and logs everything while creating no device
+and running no hooks. Use it on hardware whose behaviour you do not yet trust.
+
+## Configuration
+
+Everything is optional; delete the file and hinged autodetects. See
+[`examples/config.toml`](examples/config.toml). Unknown keys are rejected rather
+than ignored — a silent typo in a file that decides whether your keyboard
+switches off is not an acceptable failure mode.
+
+All desktop behaviour lives in hooks rather than being compiled in, which is
+what lets one binary serve GNOME, KDE, sway and everything else. Commands are
+argv arrays, never shell strings, and every hook's exit code and stderr are
+logged so a broken one is visible.
+
+## On-screen keyboard and dictation
+
+hinged does not ship a keyboard. A good OSK is a large project on its own and
+several maintained ones exist; what is missing on a convertible is something
+that knows *when* to show one. hinged drives whichever you have — Onboard,
+wvkbd, squeekboard — and on GNOME and KDE deliberately does nothing, because
+their shells already react to the `SW_TABLET_MODE` hinged now supplies.
+
+For dictation it calls **[vox](https://github.com/denelson1-dot/vox)**, a
+separate system-wide service. That split is deliberate: the speech model loads
+once and is shared by everything on the machine, instead of every project
+carrying its own copy of the same few hundred megabytes.
 
 ### Thresholds are not compiled in
 

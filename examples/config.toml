@@ -1,0 +1,86 @@
+# hinged configuration
+#
+# Every key is optional. Delete this file and hinged autodetects everything.
+# Copy to ~/.config/hinged/config.toml to use it.
+#
+#   hinged config    show what is loaded and where it came from
+
+[posture]
+# Angles in degrees. These defaults are calibrated for an HP ENVY x360 and are
+# a starting point, not a universal truth. For contrast, the ChromeOS EC ships
+# 180 with 20 degrees of hysteresis and treats under 15 as closed.
+#
+# enter_angle  = 210.0   # at or above this, the keyboard is folded away
+# leave_angle  = 180.0   # at or below this, laptop posture
+# wrap_guard   = 30.0    # below this, a reading may be a hinge wrapped past 360
+# tablet_angle = 300.0   # at or above this, fully folded
+#
+# The gap between leave_angle and enter_angle is deliberate hysteresis. Without
+# it the posture flaps while the hinge rests near a threshold. Never set them
+# equal; hinged refuses to start if you do.
+
+# max_slew_rate = 720.0  # reject change faster than this, degrees/second
+
+# If the sensor stops answering while tablet mode is asserted, release anyway.
+# Releasing must never depend on the sensor's cooperation.
+# sensor_lost_grace = "5s"
+
+[uinput]
+# Identity of the synthesized switch. Worth changing only if libinput declines
+# to honour the default; `hinged doctor` will tell you.
+# name    = "hinged virtual tablet mode switch"
+# bustype = "virtual"
+
+# ---------------------------------------------------------------------------
+# Hooks. All desktop-specific behaviour lives here rather than being compiled
+# in, which is what lets one binary serve GNOME, KDE, sway and everything else.
+#
+# Commands are argv arrays, never shell strings. Every hook's exit code and
+# stderr are logged, so a broken hook is visible instead of silently doing
+# nothing.
+#
+# Environment: HINGED_POSTURE HINGED_PREVIOUS HINGED_ANGLE HINGED_SWITCH
+#              HINGED_REASON
+# ---------------------------------------------------------------------------
+
+# Show an on-screen keyboard in tablet posture.
+#
+# Skip this on GNOME and KDE: their shells already react to SW_TABLET_MODE,
+# which hinged now supplies, so driving a keyboard yourself fights the desktop.
+#[[hooks]]
+#event   = "tablet"
+#command = ["onboard"]
+#async   = true
+
+#[[hooks]]
+#event   = "laptop"
+#command = ["pkill", "-KILL", "-x", "onboard"]
+
+# Unlock screen rotation in tablet posture. hinged does not rotate your screen:
+# iio-sensor-proxy and your desktop already do that, better. This only lets it.
+#[[hooks]]
+#event   = "tablet"
+#command = ["gsettings", "set", "org.gnome.settings-daemon.plugins.orientation", "active", "true"]
+
+# ---------------------------------------------------------------------------
+# Dictation, via vox: https://github.com/denelson1-dot/vox
+#
+# vox is a separate system-wide service, so the speech model loads once and is
+# shared by everything on the machine rather than duplicated per project.
+# Bind `vox toggle` to a key, or call it from a touch target in tablet mode.
+# ---------------------------------------------------------------------------
+
+#[[hooks]]
+#event   = "tablet"
+#command = ["systemctl", "--user", "start", "vox"]
+#async   = true
+
+# Cancel any in-flight dictation when returning to laptop posture.
+#[[hooks]]
+#event   = "laptop"
+#command = ["vox", "cancel"]
+
+#[[hooks]]
+#event   = "any"
+#command = ["notify-send", "-t", "1500", "Posture changed"]
+#async   = true

@@ -1,0 +1,68 @@
+# hinged configuration
+#
+#   hinged config    show what is loaded and from where
+
+[posture]
+# Verified on this machine: asserts at 210, releases at 180, no flapping
+# across a full fold cycle. Left at the defaults deliberately.
+
+# ---------------------------------------------------------------------------
+# On-screen keyboard.
+#
+# Onboard's two quirks are preserved as hook data rather than code, because
+# they are properties of Onboard rather than of hinged:
+#
+#   auto-show must be turned off BEFORE hiding, or the focused text field
+#   reopens the keyboard the instant it is dismissed.
+#
+#   it must be killed with SIGKILL, not SIGTERM: its language-model destructor
+#   crashes on clean shutdown under Python 3.12 and leaves a ~9 MB core dump.
+# ---------------------------------------------------------------------------
+
+[[hooks]]
+event   = "tablet"
+command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "true"]
+
+[[hooks]]
+event   = "tablet"
+command = ["onboard"]
+async   = true
+
+[[hooks]]
+event   = "tent"
+command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "true"]
+
+[[hooks]]
+event   = "tent"
+command = ["onboard"]
+async   = true
+
+# Order matters here: auto-show off first, then kill.
+[[hooks]]
+event   = "laptop"
+command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "false"]
+
+[[hooks]]
+event   = "laptop"
+command = ["pkill", "-KILL", "-x", "onboard"]
+# pkill exits 1 when nothing matched, which is the normal case here.
+ignore_exit = true
+
+# ---------------------------------------------------------------------------
+# Dictation, via vox.
+#
+# vox runs as its own always-on service, so nothing needs starting on fold.
+# What matters on unfold is abandoning any recording still in flight: a
+# half-finished dictation that types itself into whatever you opened next is
+# a genuinely unpleasant surprise.
+# ---------------------------------------------------------------------------
+
+[[hooks]]
+event   = "laptop"
+command = ["vox", "cancel"]
+ignore_exit = true
+
+[[hooks]]
+event   = "closed"
+command = ["vox", "cancel"]
+ignore_exit = true

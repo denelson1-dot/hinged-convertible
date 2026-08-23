@@ -36,6 +36,15 @@ type Hook struct {
 
 	Timeout time.Duration
 	Async   bool
+
+	// IgnoreExit treats a non-zero exit as success.
+	//
+	// Cleanup hooks routinely exit non-zero when there is nothing to clean:
+	// pkill returns 1 when no process matched, which is the ordinary case on
+	// every transition where the keyboard was not showing. Logging that as a
+	// failure trains people to ignore the log, which defeats the point of
+	// reporting real failures at all.
+	IgnoreExit bool
 }
 
 // Runner executes hooks and reports on their health.
@@ -101,7 +110,7 @@ func (r *Runner) exec(ctx context.Context, idx int, h Hook, tr policy.Transition
 	err := cmd.Run()
 	dur := time.Since(start)
 
-	if err == nil {
+	if err == nil || (h.IgnoreExit && cctx.Err() == nil) {
 		r.failures[idx] = 0
 		r.log.Debug("hook ok", "event", h.Event, "cmd", h.Command[0], "took", dur)
 		return

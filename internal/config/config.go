@@ -233,6 +233,8 @@ func assignHook(h *hooks.Hook, key, val string) error {
 		h.Timeout = d
 	case "async":
 		h.Async = val == "true"
+	case "ignore_exit":
+		h.IgnoreExit = val == "true"
 	default:
 		return fmt.Errorf("unknown key %q in [[hooks]]", key)
 	}

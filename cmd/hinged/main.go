@@ -14,7 +14,12 @@ import (
 	"syscall"
 	"text/tabwriter"
 
+	"log/slog"
+
+	"github.com/denelson1-dot/hinged-convertible/internal/config"
+	"github.com/denelson1-dot/hinged-convertible/internal/daemon"
 	"github.com/denelson1-dot/hinged-convertible/internal/probe"
+	"github.com/denelson1-dot/hinged-convertible/internal/uinput"
 	"github.com/denelson1-dot/hinged-convertible/internal/watch"
 	"github.com/denelson1-dot/hinged-convertible/policy"
 )
@@ -22,9 +27,16 @@ import (
 const usage = `hinged - tablet mode for Linux convertibles
 
 Usage:
+  hinged daemon    Run the posture daemon: synthesize SW_TABLET_MODE and run hooks
   hinged doctor    Report what this machine exposes and what hinged would use
   hinged watch     Watch posture live, read-only, without changing anything
+  hinged config    Show the loaded configuration and where it came from
+  hinged release   Publish SW_TABLET_MODE=0 and exit (recovery)
   hinged version   Print the version
+
+Daemon flags:
+  -dry-run       Decide and log everything, but create no device and run no hooks
+  -config PATH   Use a specific config file
 
 Threshold flags (watch):
   -enter-angle   Angle at or above which the keyboard counts as folded away
@@ -59,6 +71,48 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	switch args[0] {
+	case "daemon":
+		return daemonCmd(args[1:], stdout, stderr)
+
+	case "config":
+		f, err := config.Load("")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "source: %s\n\n", f.Source)
+		fmt.Fprintf(stdout, "[posture]\n  enter_angle  = %g\n  leave_angle  = %g\n"+
+			"  wrap_guard   = %g\n  tablet_angle = %g\n  max_slew_rate = %g\n"+
+			"  sensor_lost_grace = %v\n",
+			f.Policy.TentMin, f.Policy.LaptopMax, f.Policy.WrapGuard,
+			f.Policy.TabletMin, f.Policy.MaxSlewRate, f.Policy.SensorLostGrace)
+		fmt.Fprintf(stdout, "\n[uinput]\n  name = %q\n", f.Uinput.Name)
+		fmt.Fprintf(stdout, "\nhooks: %d\n", len(f.Hooks))
+		for _, h := range f.Hooks {
+			fmt.Fprintf(stdout, "  on %-7s %v\n", h.Event, h.Command)
+		}
+		fmt.Fprintf(stdout, "\nconfig file path: %s\n", config.Path())
+		return nil
+
+	case "release":
+		// Recovery. Destroying an asserting switch does not make libinput
+		// resume the keyboard, so if a previous daemon died mid-assert the fix
+		// is to publish a released state from a fresh device and tear it down
+		// cleanly. Wired to hinged-restore.service.
+		cfg := uinput.DefaultConfig()
+		sw, err := uinput.Create(cfg)
+		if err != nil {
+			return fmt.Errorf("creating a switch to publish a released state: %w", err)
+		}
+		if err := sw.Set(false); err != nil {
+			sw.Close()
+			return err
+		}
+		if err := sw.Close(); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "published SW_TABLET_MODE=0 and destroyed the device")
+		return nil
+
 	case "doctor":
 		doctor(stdout)
 		return nil
@@ -88,6 +142,43 @@ func run(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
 		return flag.ErrHelp
 	}
+}
+
+// daemonCmd runs the posture daemon.
+func daemonCmd(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dryRun := fs.Bool("dry-run", false, "decide and log everything, but change nothing")
+	cfgPath := fs.String("config", "", "path to a config file")
+	verbose := fs.Bool("v", false, "verbose logging")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	f, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+	log.Info("configuration", "source", f.Source, "hooks", len(f.Hooks))
+
+	// Signals cancel a context rather than only notifying, so a stop request
+	// is honoured even while blocked, and the deferred release always runs.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return daemon.Run(ctx, daemon.Options{
+		Policy: f.Policy,
+		Uinput: f.Uinput,
+		Hooks:  f.Hooks,
+		DryRun: *dryRun,
+		Log:    log,
+	})
 }
 
 // configFromFlags builds a policy config, letting any threshold be overridden.

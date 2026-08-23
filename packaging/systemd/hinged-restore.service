@@ -1,0 +1,11 @@
+[Unit]
+Description=hinged - release the virtual tablet-mode switch after an abnormal exit
+Documentation=https://github.com/denelson1-dot/hinged-convertible
+
+[Service]
+Type=oneshot
+# Destroying an asserting switch device does not make libinput resume the
+# keyboard. If the daemon died without releasing, this re-creates the device,
+# publishes a released state, and tears it down cleanly.
+ExecStart=%h/.local/bin/hinged release
+RemainAfterExit=no

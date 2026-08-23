@@ -20,7 +20,6 @@ import (
 	"github.com/denelson1-dot/hinged-convertible/internal/daemon"
 	"github.com/denelson1-dot/hinged-convertible/internal/probe"
 	"github.com/denelson1-dot/hinged-convertible/internal/uinput"
-	"github.com/denelson1-dot/hinged-convertible/internal/watch"
 	"github.com/denelson1-dot/hinged-convertible/policy"
 )
 
@@ -38,15 +37,13 @@ Daemon flags:
   -dry-run       Decide and log everything, but create no device and run no hooks
   -config PATH   Use a specific config file
 
-Threshold flags (watch):
-  -enter-angle   Angle at or above which the keyboard counts as folded away
-  -leave-angle   Angle at or below which the machine is in laptop posture
-  -wrap-guard    Angle below which a reading may be a hinge wrapped past 360
-  -tablet-angle  Angle at or above which the machine is fully folded
-  -max-slew      Reject angular change faster than this, degrees/second
+  -enter-angle   Override: assert tablet mode at or above this angle
+  -leave-angle   Override: laptop posture at or below this angle
+  -wrap-guard    Override: below this, a reading may be a wrapped hinge
 
-The defaults are calibrated for one chassis and will not suit every machine.
-Run 'hinged doctor' first; its output is what to paste into a bug report.
+'hinged watch' is 'hinged daemon --dry-run': it decides everything and changes
+nothing. The defaults suit one chassis; run 'hinged doctor' first, and put
+lasting changes in the config file rather than flags.
 `
 
 // version is set at build time via -ldflags.
@@ -118,17 +115,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return nil
 
 	case "watch":
-		cfg, err := configFromFlags(args[1:], stderr)
-		if err != nil {
-			return err
-		}
-		// Signals are wired before any I/O and cancel a context rather than
-		// only filling a channel. A handler that merely notifies is useless if
-		// the loop is blocked on a wedged sensor read, and for a daemon that
-		// means `systemctl stop` hangs until it escalates to SIGKILL.
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-		return watch.Run(ctx, stdout, cfg)
+		// Watching is the daemon deciding everything and changing nothing, so
+		// it is that rather than a second implementation of the same loop.
+		return daemonCmd(append([]string{"-dry-run"}, args[1:]...), stdout, stderr)
 
 	case "version":
 		fmt.Fprintln(stdout, version)
@@ -151,12 +140,28 @@ func daemonCmd(args []string, stdout, stderr io.Writer) error {
 	dryRun := fs.Bool("dry-run", false, "decide and log everything, but change nothing")
 	cfgPath := fs.String("config", "", "path to a config file")
 	verbose := fs.Bool("v", false, "verbose logging")
+	enter := fs.Float64("enter-angle", 0, "override: assert tablet mode at or above this angle")
+	leave := fs.Float64("leave-angle", 0, "override: laptop posture at or below this angle")
+	wrap := fs.Float64("wrap-guard", 0, "override: below this, a reading may be a wrapped hinge")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	f, err := config.Load(*cfgPath)
 	if err != nil {
+		return err
+	}
+	// Flags override the file. Zero means "not given" rather than a real
+	// threshold, since none of these are meaningfully zero.
+	for _, o := range []struct {
+		v   float64
+		dst *float64
+	}{{*enter, &f.Policy.TentMin}, {*leave, &f.Policy.LaptopMax}, {*wrap, &f.Policy.WrapGuard}} {
+		if o.v != 0 {
+			*o.dst = o.v
+		}
+	}
+	if err := f.Policy.Validate(); err != nil {
 		return err
 	}
 
@@ -179,29 +184,6 @@ func daemonCmd(args []string, stdout, stderr io.Writer) error {
 		DryRun: *dryRun,
 		Log:    log,
 	})
-}
-
-// configFromFlags builds a policy config, letting any threshold be overridden.
-// Compiled-in thresholds were the main reason this only suited one chassis.
-func configFromFlags(args []string, stderr io.Writer) (policy.Config, error) {
-	cfg := policy.DefaultConfig()
-
-	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Float64Var(&cfg.TentMin, "enter-angle", cfg.TentMin, "assert tablet mode at or above this angle")
-	fs.Float64Var(&cfg.LaptopMax, "leave-angle", cfg.LaptopMax, "laptop posture at or below this angle")
-	fs.Float64Var(&cfg.WrapGuard, "wrap-guard", cfg.WrapGuard, "below this, a reading may be a hinge wrapped past 360")
-	fs.Float64Var(&cfg.TabletMin, "tablet-angle", cfg.TabletMin, "fully folded at or above this angle")
-	fs.Float64Var(&cfg.MaxSlewRate, "max-slew", cfg.MaxSlewRate, "reject angular change faster than this in degrees/second (0 disables)")
-	if err := fs.Parse(args); err != nil {
-		return cfg, err
-	}
-
-	// Validated here rather than letting the engine silently do nothing.
-	if err := cfg.Validate(); err != nil {
-		return cfg, fmt.Errorf("%w\n\nthresholds must satisfy 0 < wrap-guard < leave-angle < enter-angle < tablet-angle", err)
-	}
-	return cfg, nil
 }
 
 func doctor(out io.Writer) {

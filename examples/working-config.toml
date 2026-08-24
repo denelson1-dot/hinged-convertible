@@ -47,6 +47,22 @@ ignore_exit = true
 # Onboard is still the better keyboard for ordinary application text fields,
 # and remains the default on desktops that ship no keyboard of their own.
 #
+# Close the shell's keyboard on unfold. The panel is killed at the same moment,
+# so nothing else would: an on-screen keyboard left covering a third of the
+# screen after returning to laptop posture is worse than never showing it.
+#
+# Eval close() rather than ToggleKeyboard, because a toggle would open the
+# keyboard if it happened to be closed already.
+[[hooks]]
+event   = "laptop"
+command = ["gdbus", "call", "--session", "--dest", "org.Cinnamon", "--object-path", "/org/Cinnamon", "--method", "org.Cinnamon.Eval", "Main.virtualKeyboardManager.close();true"]
+ignore_exit = true
+
+[[hooks]]
+event   = "closed"
+command = ["gdbus", "call", "--session", "--dest", "org.Cinnamon", "--object-path", "/org/Cinnamon", "--method", "org.Cinnamon.Eval", "Main.virtualKeyboardManager.close();true"]
+ignore_exit = true
+
 # Kept as a safety net in case Onboard was started by something else.
 [[hooks]]
 event   = "laptop"

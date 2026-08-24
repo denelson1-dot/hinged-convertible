@@ -143,15 +143,20 @@ type oskDefault struct{ name, show, hide string }
 // desktop that ships its own, the built-in one is the only one that can type
 // into that desktop's UI.
 func detectOSK() oskDefault {
-	const cinnamonToggle = "gdbus call --session --dest org.Cinnamon " +
+	const cinnamonShow = "gdbus call --session --dest org.Cinnamon " +
 		"--object-path /org/Cinnamon --method org.Cinnamon.ToggleKeyboard"
+	// Hiding uses Eval rather than the toggle. A toggle depends on the panel's
+	// belief about the keyboard's state matching reality, and they drift: the
+	// shell opens and closes its own keyboard on focus changes without telling
+	// anyone. close() is unconditional, so hide always hides.
+	const cinnamonHide = "gdbus call --session --dest org.Cinnamon " +
+		"--object-path /org/Cinnamon --method org.Cinnamon.Eval " +
+		"Main.virtualKeyboardManager.close();true"
 
 	desk := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP") + " " + os.Getenv("XDG_SESSION_DESKTOP"))
 	switch {
 	case strings.Contains(desk, "cinnamon"):
-		// ToggleKeyboard is a toggle, so the same command serves both ways;
-		// the panel tracks which state it believes the keyboard is in.
-		return oskDefault{"cinnamon", cinnamonToggle, cinnamonToggle}
+		return oskDefault{"cinnamon", cinnamonShow, cinnamonHide}
 	case strings.Contains(desk, "gnome"), strings.Contains(desk, "kde"), strings.Contains(desk, "plasma"):
 		// These shells show their own keyboard in response to
 		// SW_TABLET_MODE, which hinged now supplies, so driving one here

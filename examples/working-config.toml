@@ -47,11 +47,13 @@ ignore_exit = true
 # Onboard is still the better keyboard for ordinary application text fields,
 # and remains the default on desktops that ship no keyboard of their own.
 #
-# Close the shell's keyboard on unfold. The panel is killed at the same moment,
-# so nothing else would: an on-screen keyboard left covering a third of the
-# screen after returning to laptop posture is worse than never showing it.
+# Close whichever keyboard is up on unfold. The panel is killed at the same
+# moment, so nothing else would, and a keyboard left covering the screen in
+# laptop posture is worse than never showing one.
 #
-# Eval close() rather than ToggleKeyboard, because a toggle would open the
+# Both are here because either keyboard may be in use: Onboard is the default,
+# and Cinnamon's is available for typing into the shell's own menus. Eval
+# close() rather than ToggleKeyboard, because a toggle would open the shell
 # keyboard if it happened to be closed already.
 [[hooks]]
 event   = "laptop"

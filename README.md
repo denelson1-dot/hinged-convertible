@@ -214,22 +214,41 @@ several maintained ones exist; what is missing on a convertible is something
 that knows *when* to show one. The panel drives whichever your desktop has,
 detected automatically:
 
-| Desktop | Keyboard used | Why |
-|---|---|---|
-| Cinnamon | the shell's own, via `org.Cinnamon.ToggleKeyboard` | see below |
-| GNOME, KDE | nothing — the shell reacts to `SW_TABLET_MODE` itself | don't fight the desktop |
-| wlroots | `wvkbd` | |
-| anything else | Onboard | best general-purpose keyboard |
+| Desktop | Keyboard used |
+|---|---|
+| GNOME, KDE | nothing — the shell reacts to `SW_TABLET_MODE` itself |
+| wlroots | `wvkbd` |
+| anything else, incl. Cinnamon | Onboard |
 
-**Prefer the desktop's own keyboard, even when it is worse.** A shell's menus
-take a modal grab, and clicking any other X client dismisses them — so typing
-into the start menu with a separate keyboard application closes the menu you
-were typing into. The shell's own keyboard lives in the same process as its
-menus and does not break their grabs. Onboard is the better keyboard for
-ordinary application text fields; it simply cannot type into the shell.
+### The one thing no keyboard gets right
 
-Override with `hinged-panel -osk-show CMD -osk-hide CMD` if the detection is
-wrong for your setup.
+A desktop shell's menus take a modal grab, and clicking any other X client
+dismisses them. So typing into the start menu with Onboard **closes the menu
+you were typing into**. The shell's own keyboard does not have this problem,
+because it lives in the same process as the menu.
+
+But on Cinnamon that keyboard's size is hardcoded: `_relayout()` sets its
+height to `monitor.height / 3` at full width and never consults
+`keyboard-size`. On a 1080p display it is always 360px tall.
+
+So it is a genuine tradeoff, and hinged does not pretend otherwise. Onboard is
+the default because giving up a third of the screen permanently is the worse
+deal for most people. To go the other way on Cinnamon:
+
+```sh
+HINGED_OSK=cinnamon hinged-panel
+```
+
+or set `-osk-show` / `-osk-hide` explicitly. Voice is the third option, and the
+only one with no drawback here: `vox` types through a kernel-level virtual
+keyboard, so dictating into a menu involves no pointer and breaks no grab.
+
+### Moving the panel
+
+Drag it. A press that moves more than 8px is a drag, anything less is a tap, so
+one finger does both. The position is remembered in
+`$XDG_STATE_HOME/hinged/panel-position` and rescaled if the screen geometry
+changes, so it survives a rotation.
 
 For dictation it calls **[vox](https://github.com/denelson1-dot/vox)**, a
 separate system-wide service. That split is deliberate: the speech model loads

@@ -93,7 +93,14 @@ type panel struct {
 	gc     xproto.Gcontext
 	screen *xproto.ScreenInfo
 
-	debug     bool
+	debug bool
+	// Drag state. dragThreshold keeps a slightly unsteady tap from being read
+	// as a drag, which matters on a touchscreen far more than with a mouse.
+	pressed, dragging bool
+	pressX, pressY    int16 // where the press started, in root coordinates
+	grabX, grabY      int16 // where within the panel it was grabbed
+	moved             bool  // the user has positioned it; stop auto-anchoring
+
 	state     string // vox state: ready | listening | transcribing
 	kbdShown  bool
 	lastRaise time.Time
@@ -156,6 +163,21 @@ func detectOSK() oskDefault {
 	desk := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP") + " " + os.Getenv("XDG_SESSION_DESKTOP"))
 	switch {
 	case strings.Contains(desk, "cinnamon"):
+		// Onboard by default, despite being unable to type into Cinnamon's own
+		// menus. The shell's keyboard can do that, but its size is hardcoded to
+		// a third of the screen -- _relayout() sets height to monitor.height/3
+		// and never consults keyboard-size -- which is too much of the display
+		// to give up for the one case it uniquely handles.
+		//
+		// To prefer menu typing over screen space, run the panel with:
+		//   hinged-panel -osk-show '<cinnamon toggle>' -osk-hide '<cinnamon close>'
+		// or set them in the hook. Both commands are in the README.
+		if os.Getenv("HINGED_OSK") == "cinnamon" {
+			return oskDefault{"cinnamon", cinnamonShow, cinnamonHide}
+		}
+		if hasBinary("onboard") {
+			return oskDefault{"onboard", "onboard", "pkill -KILL -x onboard"}
+		}
 		return oskDefault{"cinnamon", cinnamonShow, cinnamonHide}
 	case strings.Contains(desk, "gnome"), strings.Contains(desk, "kde"), strings.Contains(desk, "plasma"):
 		// These shells show their own keyboard in response to
@@ -221,6 +243,7 @@ func (p *panel) createWindow() error {
 		//    which is what makes "never takes focus" a guarantee rather than a
 		//    request the WM is free to ignore.
 		uint32(xproto.EventMaskExposure | xproto.EventMaskButtonPress |
+			xproto.EventMaskButtonRelease | xproto.EventMaskPointerMotion |
 			xproto.EventMaskVisibilityChange | xproto.EventMaskStructureNotify),
 	}
 
@@ -371,8 +394,15 @@ func (p *panel) watchScreen() {
 	}
 }
 
-// reposition anchors the panel to the top-right of the current screen.
+// reposition places the panel: where the user last dragged it if they have
+// moved it, otherwise anchored to the top-right.
 func (p *panel) reposition(sw, sh uint16) {
+	if x, y, ok := loadPosition(sw, sh); ok {
+		xproto.ConfigureWindow(p.conn, p.win,
+			xproto.ConfigWindowX|xproto.ConfigWindowY, []uint32{uint32(int32(x)), uint32(int32(y))})
+		p.conn.Sync()
+		return
+	}
 	x := int(sw) - panelW - margin
 	y := topGap
 	// On a tall portrait screen the panel would sit oddly high; keep it in the
@@ -443,7 +473,19 @@ func (p *panel) eventLoop() error {
 			p.logf("Expose count=%d", e.Count)
 			p.redraw()
 		case xproto.ButtonPressEvent:
-			p.click(e.EventY)
+			p.pressX, p.pressY = e.RootX, e.RootY
+			p.grabX, p.grabY = e.EventX, e.EventY
+			p.pressed, p.dragging = true, false
+		case xproto.MotionNotifyEvent:
+			p.motion(e.RootX, e.RootY)
+		case xproto.ButtonReleaseEvent:
+			if p.pressed && !p.dragging {
+				p.click(p.grabY)
+			}
+			if p.dragging {
+				p.savePosition()
+			}
+			p.pressed, p.dragging = false, false
 		case xproto.VisibilityNotifyEvent:
 			p.logf("VisibilityNotify state=%d (0=unobscured 1=partial 2=fully)", e.State)
 			// Anything other than fully visible means something stacked above
@@ -454,6 +496,111 @@ func (p *panel) eventLoop() error {
 			}
 		}
 	}
+}
+
+const dragThreshold = 8 // pixels before a press becomes a drag
+
+// motion moves the panel while a press is held.
+func (p *panel) motion(rootX, rootY int16) {
+	if !p.pressed {
+		return
+	}
+	if !p.dragging {
+		if abs16(rootX-p.pressX) < dragThreshold && abs16(rootY-p.pressY) < dragThreshold {
+			return
+		}
+		p.dragging = true
+		p.logf("drag started")
+	}
+	x, y := int(rootX-p.grabX), int(rootY-p.grabY)
+	geo, err := xproto.GetGeometry(p.conn, xproto.Drawable(p.screen.Root)).Reply()
+	if err == nil {
+		// Keep it reachable: never let it be dragged fully off the screen.
+		x = clamp(x, 0, int(geo.Width)-panelW)
+		y = clamp(y, 0, int(geo.Height)-panelH)
+	}
+	p.moved = true
+	xproto.ConfigureWindow(p.conn, p.win,
+		xproto.ConfigWindowX|xproto.ConfigWindowY, []uint32{uint32(int32(x)), uint32(int32(y))})
+	p.conn.Sync()
+}
+
+func abs16(v int16) int16 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func clamp(v, lo, hi int) int {
+	if hi < lo {
+		return lo
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// positionFile is where a dragged position is remembered, so the panel comes
+// back where it was left rather than snapping to a corner on every fold.
+func positionFile() string {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = home + "/.local/state"
+	}
+	return dir + "/hinged/panel-position"
+}
+
+func (p *panel) savePosition() {
+	geo, err := xproto.GetGeometry(p.conn, xproto.Drawable(p.win)).Reply()
+	if err != nil {
+		return
+	}
+	f := positionFile()
+	if f == "" {
+		return
+	}
+	os.MkdirAll(f[:strings.LastIndex(f, "/")], 0o755)
+	// Stored relative to the screen size it was set on, so the position still
+	// makes sense after a rotation or a display change.
+	root, err := xproto.GetGeometry(p.conn, xproto.Drawable(p.screen.Root)).Reply()
+	if err != nil {
+		return
+	}
+	os.WriteFile(f, []byte(fmt.Sprintf("%d %d %d %d\n",
+		geo.X, geo.Y, root.Width, root.Height)), 0o644)
+	p.logf("saved position %d,%d", geo.X, geo.Y)
+}
+
+// loadPosition returns a remembered position scaled to the current screen.
+func loadPosition(sw, sh uint16) (int, int, bool) {
+	f := positionFile()
+	if f == "" {
+		return 0, 0, false
+	}
+	b, err := os.ReadFile(f)
+	if err != nil {
+		return 0, 0, false
+	}
+	var x, y int
+	var w, h uint16
+	if _, err := fmt.Sscanf(string(b), "%d %d %d %d", &x, &y, &w, &h); err != nil || w == 0 || h == 0 {
+		return 0, 0, false
+	}
+	// Rescale proportionally if the screen has changed since.
+	if w != sw || h != sh {
+		x = x * int(sw) / int(w)
+		y = y * int(sh) / int(h)
+	}
+	return clamp(x, 0, int(sw)-panelW), clamp(y, 0, int(sh)-panelH), true
 }
 
 // buttonAt returns which button a tap landed on, or -1 for the gaps between.

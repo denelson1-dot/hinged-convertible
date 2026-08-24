@@ -65,12 +65,13 @@ import (
 // smallest comfortable touch target is around 9mm, which is ~48px at typical
 // laptop density, and these are deliberately larger.
 const (
-	panelW = 150
-	panelH = 210
-	btnH   = 96
-	pad    = 8
-	margin = 24 // gap from the screen edge
-	topGap = 72 // clears a top panel on most desktops
+	panelW  = 116
+	btnH    = 54
+	pad     = 6
+	nButton = 3
+	panelH  = pad + nButton*(btnH+pad) // 186
+	margin  = 20                       // gap from the screen edge
+	topGap  = 72                       // clears a top panel on most desktops
 )
 
 // Colours as 0xRRGGBB.
@@ -80,6 +81,7 @@ const (
 	colListening    = 0xc62828
 	colTranscribing = 0xd17a00
 	colKeys         = 0x37474f
+	colEnter        = 0x2e5d4b
 	colIcon         = 0xffffff
 	colBorder       = 0x5a6270
 )
@@ -407,13 +409,47 @@ func (p *panel) eventLoop() error {
 	}
 }
 
-// click dispatches on which half of the panel was tapped.
-func (p *panel) click(y int16) {
-	if int(y) < pad+btnH {
-		p.toggleVoice()
-		return
+// buttonAt returns which button a tap landed on, or -1 for the gaps between.
+// Taps in the padding do nothing rather than being rounded to a neighbour: a
+// mis-hit that submits a form is worse than one that does nothing.
+func buttonAt(y int16) int {
+	for i := 0; i < nButton; i++ {
+		top := pad + i*(btnH+pad)
+		if int(y) >= top && int(y) < top+btnH {
+			return i
+		}
 	}
-	p.toggleKeyboard()
+	return -1
+}
+
+func (p *panel) click(y int16) {
+	switch buttonAt(y) {
+	case 0:
+		p.toggleVoice()
+	case 1:
+		p.toggleKeyboard()
+	case 2:
+		p.pressEnter()
+	}
+}
+
+// pressEnter submits whatever was just dictated.
+//
+// It goes through vox rather than the panel growing its own virtual keyboard:
+// vox already owns one and the device permissions for it, and a second
+// synthetic keyboard would be a second thing to get right.
+func (p *panel) pressEnter() {
+	go func() {
+		conn, err := net.Dial("unix", p.voxSocket)
+		if err != nil {
+			p.logf("enter: vox unreachable: %v", err)
+			return
+		}
+		defer conn.Close()
+		fmt.Fprintln(conn, "key Return")
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		p.logf("enter: %s", strings.TrimSpace(line))
+	}()
 }
 
 func (p *panel) toggleVoice() {
@@ -479,6 +515,9 @@ func (p *panel) fill(x, y int16, w, h uint16, c uint32) {
 		[]xproto.Rectangle{{X: x, Y: y, Width: w, Height: h}})
 }
 
+// buttonTop is the y of button i.
+func buttonTop(i int) int16 { return int16(pad + i*(btnH+pad)) }
+
 func (p *panel) redraw() {
 	// Drawing is a sequence of "set colour, then draw" pairs, so two
 	// goroutines interleaving would paint with each other's colours. The vox
@@ -488,20 +527,45 @@ func (p *panel) redraw() {
 	p.logf("redraw state=%s kbd=%v", p.state, p.kbdShown)
 
 	p.fill(0, 0, panelW, panelH, colBackdrop)
+	w := uint16(panelW - 2*pad)
 
-	micY := int16(pad)
-	p.fill(pad, micY, panelW-2*pad, btnH, p.micColor())
+	micY := buttonTop(0)
+	p.fill(pad, micY, w, btnH, p.micColor())
 	p.drawMic(panelW/2, micY+btnH/2)
 
-	kbdY := int16(pad + btnH + pad)
-	p.fill(pad, kbdY, panelW-2*pad, btnH, colKeys)
+	kbdY := buttonTop(1)
+	p.fill(pad, kbdY, w, btnH, colKeys)
 	p.drawKeyboard(panelW/2, kbdY+btnH/2)
 
-	// A thin strip under the mic button repeats its state, so the panel reads
-	// correctly even for someone who cannot distinguish the button colours.
-	p.fill(pad, micY+btnH-6, p.stateBarWidth(), 6, colIcon)
+	entY := buttonTop(2)
+	p.fill(pad, entY, w, btnH, colEnter)
+	p.drawEnter(panelW/2, entY+btnH/2)
+
+	// A strip along the bottom of the mic button repeats its state as a length
+	// as well as a colour, so the panel still reads correctly to someone who
+	// cannot distinguish the button colours.
+	p.fill(pad, micY+btnH-4, p.stateBarWidth(), 4, colIcon)
 
 	p.conn.Sync()
+}
+
+// drawEnter draws a return arrow: a shaft to the left, a head, and the riser.
+func (p *panel) drawEnter(cx, cy int16) {
+	p.setColor(colIcon)
+	d := xproto.Drawable(p.win)
+
+	xproto.PolyFillRectangle(p.conn, d, p.gc, []xproto.Rectangle{
+		{X: cx - 13, Y: cy + 2, Width: 24, Height: 3}, // shaft
+		{X: cx + 8, Y: cy - 10, Width: 3, Height: 15}, // riser
+	})
+	// Arrowhead, as a stack of rows narrowing to a point.
+	var head []xproto.Rectangle
+	for i := int16(0); i < 6; i++ {
+		head = append(head, xproto.Rectangle{
+			X: cx - 13 + i, Y: cy + 3 - i, Width: 1, Height: uint16(1 + 2*i),
+		})
+	}
+	xproto.PolyFillRectangle(p.conn, d, p.gc, head)
 }
 
 func (p *panel) micColor() uint32 {
@@ -520,9 +584,9 @@ func (p *panel) micColor() uint32 {
 func (p *panel) stateBarWidth() uint16 {
 	switch p.state {
 	case "listening":
-		return panelW - 2*pad
+		return uint16(panelW - 2*pad)
 	case "transcribing":
-		return (panelW - 2*pad) / 2
+		return uint16((panelW - 2*pad) / 2)
 	default:
 		return 0
 	}
@@ -534,7 +598,7 @@ func (p *panel) drawMic(cx, cy int16) {
 	d := xproto.Drawable(p.win)
 
 	// Capsule body.
-	const bw, bh = 16, 30
+	const bw, bh = 12, 20
 	xproto.PolyFillRectangle(p.conn, d, p.gc, []xproto.Rectangle{
 		{X: cx - bw/2, Y: cy - bh/2 - 6, Width: bw, Height: bh},
 	})
@@ -545,12 +609,12 @@ func (p *panel) drawMic(cx, cy int16) {
 	})
 	// Cradle: an arc open at the top.
 	xproto.PolyArc(p.conn, d, p.gc, []xproto.Arc{
-		{X: cx - 14, Y: cy - 8, Width: 28, Height: 28, Angle1: 180 * 64, Angle2: 180 * 64},
+		{X: cx - 10, Y: cy - 6, Width: 20, Height: 20, Angle1: 180 * 64, Angle2: 180 * 64},
 	})
 	// Stem and base.
 	xproto.PolyFillRectangle(p.conn, d, p.gc, []xproto.Rectangle{
-		{X: cx - 2, Y: cy + 14, Width: 4, Height: 10},
-		{X: cx - 12, Y: cy + 24, Width: 24, Height: 4},
+		{X: cx - 1, Y: cy + 8, Width: 3, Height: 7},
+		{X: cx - 8, Y: cy + 15, Width: 17, Height: 3},
 	})
 }
 
@@ -559,7 +623,7 @@ func (p *panel) drawKeyboard(cx, cy int16) {
 	p.setColor(colIcon)
 	d := xproto.Drawable(p.win)
 
-	const kw, kh = 56, 38
+	const kw, kh = 42, 28
 	x0, y0 := cx-kw/2, cy-kh/2
 
 	// Outline, drawn as four thin bars.
@@ -575,10 +639,10 @@ func (p *panel) drawKeyboard(cx, cy int16) {
 	for row := 0; row < 2; row++ {
 		for col := 0; col < 5; col++ {
 			keys = append(keys, xproto.Rectangle{
-				X: x0 + 7 + int16(col*9), Y: y0 + 8 + int16(row*9), Width: 5, Height: 5,
+				X: x0 + 5 + int16(col*7), Y: y0 + 6 + int16(row*6), Width: 4, Height: 4,
 			})
 		}
 	}
-	keys = append(keys, xproto.Rectangle{X: x0 + 14, Y: y0 + 26, Width: 28, Height: 5})
+	keys = append(keys, xproto.Rectangle{X: x0 + 11, Y: y0 + 19, Width: 20, Height: 4})
 	xproto.PolyFillRectangle(p.conn, d, p.gc, keys)
 }

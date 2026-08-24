@@ -243,6 +243,11 @@ or set `-osk-show` / `-osk-hide` explicitly. Voice is the third option, and the
 only one with no drawback here: `vox` types through a kernel-level virtual
 keyboard, so dictating into a menu involves no pointer and breaks no grab.
 
+Only one panel runs at a time, enforced with a lock rather than left to the
+configuration. Posture hooks make duplicates easy — a fold passes through tent
+and then tablet, so a hook on each fires twice — and a second launch simply
+exits.
+
 ### Moving the panel
 
 Drag it. A press that moves more than 8px is a drag, anything less is a tap, so

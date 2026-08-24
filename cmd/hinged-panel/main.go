@@ -53,6 +53,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"encoding/binary"
@@ -125,10 +126,50 @@ func main() {
 		oskShow:   strings.Fields(*oskShow),
 		oskHide:   strings.Fields(*oskHide),
 	}
+	// Only one panel, however many times something asks for one.
+	//
+	// Posture hooks make duplicates easy: folding passes through tent and then
+	// tablet, so a hook on each fires twice on a single fold. Enforcing it here
+	// rather than in the configuration means it holds no matter how the hooks
+	// are written, and covers the user running it by hand as well.
+	release, err := acquireSingleton()
+	if err != nil {
+		// Not an error worth a non-zero exit: the panel the user wanted is
+		// already on screen, which is the outcome they were after.
+		fmt.Fprintln(os.Stderr, "hinged-panel: already running")
+		return
+	}
+	defer release()
+
 	if err := p.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "hinged-panel: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// acquireSingleton takes an exclusive lock for the lifetime of the process.
+//
+// A lock rather than a pidfile or a scan for an existing window: the kernel
+// releases it when the process dies however it dies, so a crashed panel never
+// leaves something behind that stops the next one starting.
+func acquireSingleton() (func(), error) {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = fmt.Sprintf("/run/user/%d", os.Getuid())
+	}
+	f, err := os.OpenFile(dir+"/hinged-panel.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		// If the lock file itself is unusable, running is better than not.
+		return func() {}, nil
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
 }
 
 // nativeOrder is the byte order X expects for 32-bit property values: the

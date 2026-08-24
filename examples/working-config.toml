@@ -18,13 +18,16 @@
 # you are dictating into.
 # ---------------------------------------------------------------------------
 
+# One hook per posture that needs the panel. Folding passes through tent and
+# then tablet, so both fire on a single fold -- the panel refuses to start a
+# second copy, but asking once is tidier than relying on it.
 [[hooks]]
-event   = "tablet"
+event   = "tent"
 command = ["hinged-panel"]
 async   = true
 
 [[hooks]]
-event   = "tent"
+event   = "tablet"
 command = ["hinged-panel"]
 async   = true
 

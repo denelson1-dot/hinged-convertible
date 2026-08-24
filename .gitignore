@@ -1,3 +1,10 @@
+# Build outputs. Compiled Go binaries embed absolute source paths unless built
+# with -trimpath, so a committed binary leaks the builder's home directory.
 /hinged
+/hinged-panel
 /dist/
 *.test
+*.out
+
+# Forge envelope symlink — per-machine, recreated after clone
+/.forge

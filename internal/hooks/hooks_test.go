@@ -21,13 +21,6 @@ func quiet() *slog.Logger {
 // must not be killed out from under the user. Launching a UI is a legitimate
 // thing for a posture hook to do, and the process needs to outlive the hook.
 func TestAsyncHookIsNotKilledByTimeout(t *testing.T) {
-	r := NewRunner([]Hook{{
-		Event:   "tablet",
-		Command: []string{"sleep", "5"},
-		Timeout: 300 * time.Millisecond,
-		Async:   true,
-	}}, quiet())
-
 	// A cancellable context, because the original bug was that the hook
 	// inherited one. An earlier version of this test passed context.Background
 	// and so could never have caught it.
@@ -37,7 +30,7 @@ func TestAsyncHookIsNotKilledByTimeout(t *testing.T) {
 	// A unique argument makes the process findable without depending on
 	// shell features: `exec -a` is bash-only and /bin/sh here is dash.
 	marker := "5.0" + strconv.Itoa(os.Getpid()%9973)
-	r = NewRunner([]Hook{{
+	r := NewRunner([]Hook{{
 		Event:   "tablet",
 		Command: []string{"sleep", marker},
 		Timeout: 300 * time.Millisecond,

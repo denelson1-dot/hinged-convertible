@@ -8,20 +8,30 @@
 //
 // # Why raw X11 rather than a toolkit
 //
-// Two requirements, and they pull in different directions. Tapping the panel
-// must not move focus away from whatever you are dictating into, and the panel
-// must stay on top of the on-screen keyboard it launches.
+// Two requirements, and they pull against each other. Tapping the panel must
+// not move focus away from whatever you are dictating into, and the panel must
+// stay on top of the on-screen keyboard it launches.
 //
-// An override-redirect window satisfies the first by opting out of the window
-// manager entirely -- but keep-above is a service the window manager provides,
-// so opting out forfeits it. Under a compositing WM there is not even a way to
-// notice: every window is redirected to an offscreen pixmap, so X reports them
-// all as unobscured and VisibilityNotify never fires.
+// Asking the window manager politely does not work for the first. WM_HINTS
+// with input=False is the ICCCM way to say "never focus me" -- it is what
+// set_accept_focus(false) sets -- and Muffin sets it and then focuses the
+// window's frame on click anyway. Measured: focus moved from the browser to
+// 0x2619f42, the frame the WM had wrapped around this window.
 //
-// So the panel asks the window manager for both, the same way the GTK
-// implementation it replaces did: WM_HINTS with input=False for "never focus
-// me", and _NET_WM_STATE_ABOVE for "keep me on top". Those are the properties
-// behind set_accept_focus(false) and set_keep_above(true).
+// So the window is override-redirect. That is not a hint, it is a statement
+// that the window manager must not manage this window: no frame, no place in
+// the focus model, and therefore no click-to-focus. It is the only way to make
+// this guaranteed rather than requested.
+//
+// The cost is that keep-above is also a window manager service, forfeited
+// along with everything else. An unmanaged window has to maintain its own
+// stacking, which is what the periodic raise in watchScreen is for. Events
+// cannot do it: under a compositing WM every window is redirected offscreen,
+// so X reports them all unobscured and VisibilityNotify never fires.
+//
+// The WM_HINTS and _NET_WM_STATE properties below are set anyway. A window
+// manager ignores them for an override-redirect window, but they cost nothing
+// and describe the intent for anything else that inspects the window.
 //
 // Drawing is rectangles and arcs, so there is no font handling and no theme to
 // load. On a touch target that is not a compromise: icons read better at a
@@ -154,11 +164,13 @@ func (p *panel) createWindow() error {
 	x := int16(int(p.screen.WidthInPixels) - panelW - margin)
 	y := int16(topGap)
 
-	// A managed window: the window manager is what keeps it above the
-	// keyboard, so it must not be told to leave this window alone.
-	mask := uint32(xproto.CwBackPixel | xproto.CwEventMask)
+	// The value list must be ordered by mask bit, ascending.
+	mask := uint32(xproto.CwBackPixel | xproto.CwOverrideRedirect | xproto.CwEventMask)
 	values := []uint32{
 		colBackdrop,
+		1, // override-redirect: the window manager must not manage this window,
+		//    which is what makes "never takes focus" a guarantee rather than a
+		//    request the WM is free to ignore.
 		uint32(xproto.EventMaskExposure | xproto.EventMaskButtonPress |
 			xproto.EventMaskVisibilityChange | xproto.EventMaskStructureNotify),
 	}

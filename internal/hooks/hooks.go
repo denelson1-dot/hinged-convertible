@@ -13,8 +13,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/denelson1-dot/hinged-convertible/policy"
@@ -34,8 +36,24 @@ type Hook struct {
 	// into a shell string would be an injection waiting to happen.
 	Command []string
 
+	// Timeout bounds a synchronous hook. It does not apply to async hooks:
+	// see Async.
 	Timeout time.Duration
-	Async   bool
+
+	// Async detaches the hook. It is started and then left alone -- not
+	// waited for, and never killed.
+	//
+	// This is what a hook that launches something persistent needs: an input
+	// panel, an on-screen keyboard, a notifier. Applying an execution timeout
+	// to those is actively wrong, because the timeout does not merely stop
+	// waiting, it kills the process. The panel would appear on fold and then
+	// vanish ten seconds later with the machine still folded, which is exactly
+	// what happened.
+	//
+	// The tradeoff is that an async hook is the user's to manage. hinged will
+	// not clean it up, so the paired hook on the opposite posture is what
+	// stops it.
+	Async bool
 
 	// IgnoreExit treats a non-zero exit as success.
 	//
@@ -73,7 +91,7 @@ func (r *Runner) Run(ctx context.Context, tr policy.Transition) {
 			continue
 		}
 		if h.Async {
-			go r.exec(ctx, i, h, tr)
+			r.start(i, h, tr)
 			continue
 		}
 		r.exec(ctx, i, h, tr)
@@ -82,6 +100,47 @@ func (r *Runner) Run(ctx context.Context, tr policy.Transition) {
 
 func matches(event string, p policy.Posture) bool {
 	return event == "any" || event == p.String()
+}
+
+// start launches a hook and detaches from it.
+//
+// Deliberately not exec.CommandContext: that kills the process when the
+// context ends, which is the opposite of what a detached hook wants.
+func (r *Runner) start(idx int, h Hook, tr policy.Transition) {
+	if len(h.Command) == 0 {
+		return
+	}
+	cmd := exec.Command(h.Command[0], h.Command[1:]...)
+	cmd.Env = hookEnv(tr)
+	// Its own process group, so stopping hinged does not take the panel with
+	// it and a hook cannot signal the daemon.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		r.failures[idx]++
+		r.log.Warn("hook failed to start",
+			"event", h.Event, "cmd", h.Command[0], "err", err)
+		return
+	}
+	r.failures[idx] = 0
+	r.log.Info("hook started", "event", h.Event, "cmd", h.Command[0], "pid", cmd.Process.Pid)
+
+	// Reap it so it cannot become a zombie, but never kill it.
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			r.log.Debug("async hook exited", "cmd", h.Command[0], "err", err)
+		}
+	}()
+}
+
+func hookEnv(tr policy.Transition) []string {
+	return append(os.Environ(),
+		"HINGED_POSTURE="+tr.To.String(),
+		"HINGED_PREVIOUS="+tr.From.String(),
+		"HINGED_ANGLE="+strconv.FormatFloat(tr.Angle, 'f', 1, 64),
+		"HINGED_SWITCH="+strconv.FormatBool(tr.To.TabletSwitch()),
+		"HINGED_REASON="+tr.Reason.String(),
+	)
 }
 
 func (r *Runner) exec(ctx context.Context, idx int, h Hook, tr policy.Transition) {
@@ -96,13 +155,7 @@ func (r *Runner) exec(ctx context.Context, idx int, h Hook, tr policy.Transition
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, h.Command[0], h.Command[1:]...)
-	cmd.Env = append(cmd.Environ(),
-		"HINGED_POSTURE="+tr.To.String(),
-		"HINGED_PREVIOUS="+tr.From.String(),
-		"HINGED_ANGLE="+strconv.FormatFloat(tr.Angle, 'f', 1, 64),
-		"HINGED_SWITCH="+strconv.FormatBool(tr.To.TabletSwitch()),
-		"HINGED_REASON="+tr.Reason.String(),
-	)
+	cmd.Env = hookEnv(tr)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 

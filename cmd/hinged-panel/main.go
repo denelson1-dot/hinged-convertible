@@ -8,13 +8,20 @@
 //
 // # Why raw X11 rather than a toolkit
 //
-// The one hard requirement is that tapping the panel must not move focus away
-// from whatever you are dictating into. X11 expresses this directly with an
-// override-redirect window: the window manager does not manage it, so it is
-// never given focus, never appears in a task list, and stays above managed
-// windows without asking. A toolkit would have to reach through to the same
-// property anyway, and the toolkits available either do not expose it or cost
-// a cgo dependency to get at it.
+// Two requirements, and they pull in different directions. Tapping the panel
+// must not move focus away from whatever you are dictating into, and the panel
+// must stay on top of the on-screen keyboard it launches.
+//
+// An override-redirect window satisfies the first by opting out of the window
+// manager entirely -- but keep-above is a service the window manager provides,
+// so opting out forfeits it. Under a compositing WM there is not even a way to
+// notice: every window is redirected to an offscreen pixmap, so X reports them
+// all as unobscured and VisibilityNotify never fires.
+//
+// So the panel asks the window manager for both, the same way the GTK
+// implementation it replaces did: WM_HINTS with input=False for "never focus
+// me", and _NET_WM_STATE_ABOVE for "keep me on top". Those are the properties
+// behind set_accept_focus(false) and set_keep_above(true).
 //
 // Drawing is rectangles and arcs, so there is no font handling and no theme to
 // load. On a touch target that is not a compromise: icons read better at a
@@ -37,6 +44,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"encoding/binary"
 
 	"github.com/jezek/xgb"
 	"github.com/jezek/xgb/xproto"
@@ -72,6 +81,7 @@ type panel struct {
 	gc     xproto.Gcontext
 	screen *xproto.ScreenInfo
 
+	debug     bool
 	state     string // vox state: ready | listening | transcribing
 	kbdShown  bool
 	lastRaise time.Time
@@ -82,12 +92,14 @@ type panel struct {
 }
 
 func main() {
+	debug := flag.Bool("debug", false, "log X events and redraws to stderr")
 	socket := flag.String("vox-socket", defaultVoxSocket(), "vox API socket")
 	oskShow := flag.String("osk-show", "onboard", "command to show the on-screen keyboard")
 	oskHide := flag.String("osk-hide", "pkill -KILL -x onboard", "command to hide it")
 	flag.Parse()
 
 	p := &panel{
+		debug:     *debug,
 		state:     "ready",
 		voxSocket: *socket,
 		oskShow:   strings.Fields(*oskShow),
@@ -98,6 +110,10 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// nativeOrder is the byte order X expects for 32-bit property values: the
+// server and client are on the same machine here, so it is the machine's own.
+var nativeOrder = binary.LittleEndian
 
 func defaultVoxSocket() string {
 	if s := os.Getenv("VOX_SOCKET"); s != "" {
@@ -124,6 +140,7 @@ func (p *panel) run() error {
 		return err
 	}
 	go p.watchVox()
+	go p.watchScreen()
 	return p.eventLoop()
 }
 
@@ -137,14 +154,13 @@ func (p *panel) createWindow() error {
 	x := int16(int(p.screen.WidthInPixels) - panelW - margin)
 	y := int16(topGap)
 
-	// The value list must be ordered by mask bit, ascending.
-	mask := uint32(xproto.CwBackPixel | xproto.CwOverrideRedirect | xproto.CwEventMask)
+	// A managed window: the window manager is what keeps it above the
+	// keyboard, so it must not be told to leave this window alone.
+	mask := uint32(xproto.CwBackPixel | xproto.CwEventMask)
 	values := []uint32{
 		colBackdrop,
-		1, // override-redirect: the window manager leaves this window alone,
-		//    which is what guarantees it never takes focus.
 		uint32(xproto.EventMaskExposure | xproto.EventMaskButtonPress |
-			xproto.EventMaskVisibilityChange),
+			xproto.EventMaskVisibilityChange | xproto.EventMaskStructureNotify),
 	}
 
 	if err := xproto.CreateWindowChecked(p.conn, p.screen.RootDepth, p.win, p.screen.Root,
@@ -163,6 +179,9 @@ func (p *panel) createWindow() error {
 		return err
 	}
 
+	if err := p.setHints(); err != nil {
+		return err
+	}
 	if err := xproto.MapWindowChecked(p.conn, p.win).Check(); err != nil {
 		return err
 	}
@@ -170,17 +189,82 @@ func (p *panel) createWindow() error {
 	return nil
 }
 
+// atom interns a property name, or returns 0 if the server does not know it.
+func (p *panel) atom(name string) xproto.Atom {
+	r, err := xproto.InternAtom(p.conn, false, uint16(len(name)), name).Reply()
+	if err != nil {
+		return 0
+	}
+	return r.Atom
+}
+
+// setHints asks the window manager to keep the panel visible but unfocusable.
+//
+// These must be set before the window is mapped: a window manager reads them
+// when it takes the window under management, and several ignore later changes.
+func (p *panel) setHints() error {
+	// WM_HINTS with the input field false. This is the "never give me the
+	// keyboard focus" request, and it is what set_accept_focus(false) sets.
+	// The structure is nine 32-bit values; only the flags and input fields
+	// matter here, and InputHint is bit 0.
+	hints := []uint32{1 /* InputHint */, 0 /* input = False */, 0, 0, 0, 0, 0, 0, 0}
+	buf := make([]byte, 4*len(hints))
+	for i, v := range hints {
+		nativeOrder.PutUint32(buf[i*4:], v)
+	}
+	if err := xproto.ChangePropertyChecked(p.conn, xproto.PropModeReplace, p.win,
+		xproto.AtomWmHints, xproto.AtomWmHints, 32, uint32(len(hints)), buf).Check(); err != nil {
+		return fmt.Errorf("setting WM_HINTS: %w", err)
+	}
+
+	// A managed window should identify itself: window managers, accessibility
+	// tools and the user's own diagnostics all key off these.
+	name := "hinged input panel"
+	xproto.ChangeProperty(p.conn, xproto.PropModeReplace, p.win,
+		xproto.AtomWmName, xproto.AtomString, 8, uint32(len(name)), []byte(name))
+	if na := p.atom("_NET_WM_NAME"); na != 0 {
+		if utf8 := p.atom("UTF8_STRING"); utf8 != 0 {
+			xproto.ChangeProperty(p.conn, xproto.PropModeReplace, p.win, na, utf8, 8,
+				uint32(len(name)), []byte(name))
+		}
+	}
+	// WM_CLASS is instance\0class\0.
+	class := "hinged-panel\x00Hinged-panel\x00"
+	xproto.ChangeProperty(p.conn, xproto.PropModeReplace, p.win,
+		xproto.AtomWmClass, xproto.AtomString, 8, uint32(len(class)), []byte(class))
+
+	// Utility type: a helper window rather than a document window, so window
+	// managers do not give it a titlebar or a place in the task switcher.
+	if wt, ut := p.atom("_NET_WM_WINDOW_TYPE"), p.atom("_NET_WM_WINDOW_TYPE_UTILITY"); wt != 0 && ut != 0 {
+		b := make([]byte, 4)
+		nativeOrder.PutUint32(b, uint32(ut))
+		xproto.ChangeProperty(p.conn, xproto.PropModeReplace, p.win, wt, xproto.AtomAtom, 32, 1, b)
+	}
+
+	// Above everything, and out of the taskbar and pager.
+	st := p.atom("_NET_WM_STATE")
+	var states []xproto.Atom
+	for _, n := range []string{"_NET_WM_STATE_ABOVE", "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER"} {
+		if a := p.atom(n); a != 0 {
+			states = append(states, a)
+		}
+	}
+	if st != 0 && len(states) > 0 {
+		b := make([]byte, 4*len(states))
+		for i, a := range states {
+			nativeOrder.PutUint32(b[i*4:], uint32(a))
+		}
+		xproto.ChangeProperty(p.conn, xproto.PropModeReplace, p.win, st, xproto.AtomAtom, 32,
+			uint32(len(states)), b)
+	}
+	return nil
+}
+
 // raise puts the panel back on top.
 //
-// This is necessary precisely because the window is override-redirect. That
-// property is what stops the window manager giving it focus, but it also opts
-// the window out of everything else the WM does -- including keeping it above
-// other windows. The GTK implementation this replaces got both behaviours
-// separately, via set_accept_focus(false) and set_keep_above(true); an
-// unmanaged window has to maintain its own stacking.
-//
-// Without this the panel is mapped on top, then buried by the next window that
-// raises itself, which on a desktop session is almost immediately.
+// _NET_WM_STATE_ABOVE should make this unnecessary, and mostly does. It stays
+// as a cheap backstop for two cases: window managers that honour the state
+// lazily, and other always-on-top windows mapped after us.
 func (p *panel) raise() {
 	// Rate-limited so that a fight with another always-on-top window cannot
 	// turn into a busy loop of mutual raising.
@@ -188,8 +272,59 @@ func (p *panel) raise() {
 		return
 	}
 	p.lastRaise = time.Now()
+	p.logf("raise")
 	xproto.ConfigureWindow(p.conn, p.win,
 		xproto.ConfigWindowStackMode, []uint32{xproto.StackModeAbove})
+	p.conn.Sync()
+}
+
+// watchScreen keeps the panel on screen and on top.
+//
+// Both problems need the same periodic check, and neither can be done from
+// events alone here.
+//
+// Rotation is the important one. The panel anchors to the right edge, and a
+// convertible rotates when it folds: a 1920x1080 landscape screen becomes
+// 1080x1920 portrait, so a position computed once at startup ends up hundreds
+// of pixels off the side of the display. The window is still mapped and still
+// being drawn -- it is simply nowhere the user can see it, which looks exactly
+// like it disappeared.
+//
+// Restacking is the cheaper one. _NET_WM_STATE_ABOVE handles it on a
+// well-behaved window manager, but under a compositing WM there is no reliable
+// event to fall back on: every window is redirected to an offscreen pixmap, so
+// X reports them all as unobscured and VisibilityNotify never fires.
+func (p *panel) watchScreen() {
+	var lastW, lastH uint16
+	for range time.Tick(time.Second) {
+		geo, err := xproto.GetGeometry(p.conn, xproto.Drawable(p.screen.Root)).Reply()
+		if err != nil {
+			continue
+		}
+		if geo.Width != lastW || geo.Height != lastH {
+			lastW, lastH = geo.Width, geo.Height
+			p.logf("screen is now %dx%d, repositioning", geo.Width, geo.Height)
+			p.reposition(geo.Width, geo.Height)
+		}
+		p.raise()
+	}
+}
+
+// reposition anchors the panel to the top-right of the current screen.
+func (p *panel) reposition(sw, sh uint16) {
+	x := int(sw) - panelW - margin
+	y := topGap
+	// On a tall portrait screen the panel would sit oddly high; keep it in the
+	// upper third, where a thumb can reach it while holding the machine.
+	if sh > sw {
+		y = int(sh) / 6
+	}
+	if x < 0 {
+		x = 0
+	}
+	xproto.ConfigureWindow(p.conn, p.win,
+		xproto.ConfigWindowX|xproto.ConfigWindowY,
+		[]uint32{uint32(int32(x)), uint32(int32(y))})
 	p.conn.Sync()
 }
 
@@ -224,21 +359,32 @@ func (p *panel) setState(s string) {
 	p.redraw()
 }
 
+func (p *panel) logf(format string, args ...any) {
+	if p.debug {
+		fmt.Fprintf(os.Stderr, "[%s] "+format+"\n",
+			append([]any{time.Now().Format("15:04:05.000")}, args...)...)
+	}
+}
+
 func (p *panel) eventLoop() error {
 	for {
 		ev, err := p.conn.WaitForEvent()
 		if err != nil {
+			p.logf("WaitForEvent error: %v", err)
 			return err
 		}
 		if ev == nil {
+			p.logf("nil event, exiting")
 			return nil
 		}
 		switch e := ev.(type) {
 		case xproto.ExposeEvent:
+			p.logf("Expose count=%d", e.Count)
 			p.redraw()
 		case xproto.ButtonPressEvent:
 			p.click(e.EventY)
 		case xproto.VisibilityNotifyEvent:
+			p.logf("VisibilityNotify state=%d (0=unobscured 1=partial 2=fully)", e.State)
 			// Anything other than fully visible means something stacked above
 			// us. Onboard mapping its own window is the common case.
 			if e.State != xproto.VisibilityUnobscured {
@@ -327,6 +473,7 @@ func (p *panel) redraw() {
 	// state watcher and the X event loop both redraw.
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.logf("redraw state=%s kbd=%v", p.state, p.kbdShown)
 
 	p.fill(0, 0, panelW, panelH, colBackdrop)
 

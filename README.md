@@ -211,9 +211,25 @@ logged so a broken one is visible.
 
 hinged does not ship a keyboard. A good OSK is a large project on its own and
 several maintained ones exist; what is missing on a convertible is something
-that knows *when* to show one. hinged drives whichever you have — Onboard,
-wvkbd, squeekboard — and on GNOME and KDE deliberately does nothing, because
-their shells already react to the `SW_TABLET_MODE` hinged now supplies.
+that knows *when* to show one. The panel drives whichever your desktop has,
+detected automatically:
+
+| Desktop | Keyboard used | Why |
+|---|---|---|
+| Cinnamon | the shell's own, via `org.Cinnamon.ToggleKeyboard` | see below |
+| GNOME, KDE | nothing — the shell reacts to `SW_TABLET_MODE` itself | don't fight the desktop |
+| wlroots | `wvkbd` | |
+| anything else | Onboard | best general-purpose keyboard |
+
+**Prefer the desktop's own keyboard, even when it is worse.** A shell's menus
+take a modal grab, and clicking any other X client dismisses them — so typing
+into the start menu with a separate keyboard application closes the menu you
+were typing into. The shell's own keyboard lives in the same process as its
+menus and does not break their grabs. Onboard is the better keyboard for
+ordinary application text fields; it simply cannot type into the shell.
+
+Override with `hinged-panel -osk-show CMD -osk-hide CMD` if the detection is
+wrong for your setup.
 
 For dictation it calls **[vox](https://github.com/denelson1-dot/vox)**, a
 separate system-wide service. That split is deliberate: the speech model loads

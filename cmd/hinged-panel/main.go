@@ -104,10 +104,11 @@ type panel struct {
 }
 
 func main() {
+	def := detectOSK()
 	debug := flag.Bool("debug", false, "log X events and redraws to stderr")
 	socket := flag.String("vox-socket", defaultVoxSocket(), "vox API socket")
-	oskShow := flag.String("osk-show", "onboard", "command to show the on-screen keyboard")
-	oskHide := flag.String("osk-hide", "pkill -KILL -x onboard", "command to hide it")
+	oskShow := flag.String("osk-show", def.show, "command to show the on-screen keyboard")
+	oskHide := flag.String("osk-hide", def.hide, "command to hide it")
 	flag.Parse()
 
 	p := &panel{
@@ -126,6 +127,47 @@ func main() {
 // nativeOrder is the byte order X expects for 32-bit property values: the
 // server and client are on the same machine here, so it is the machine's own.
 var nativeOrder = binary.LittleEndian
+
+// oskDefault is the show/hide pair for one desktop's keyboard.
+type oskDefault struct{ name, show, hide string }
+
+// detectOSK picks the keyboard that suits the running desktop.
+//
+// This is not just a convenience. A desktop shell's menus and dialogs take a
+// modal grab, and a click on any other X client dismisses them -- so typing
+// into the start menu with a separate keyboard application closes the very
+// thing you were typing into. A shell's own keyboard lives in the same process
+// as its menus, so it does not break their grabs.
+//
+// Onboard is the better keyboard in general and stays the fallback. But on a
+// desktop that ships its own, the built-in one is the only one that can type
+// into that desktop's UI.
+func detectOSK() oskDefault {
+	const cinnamonToggle = "gdbus call --session --dest org.Cinnamon " +
+		"--object-path /org/Cinnamon --method org.Cinnamon.ToggleKeyboard"
+
+	desk := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP") + " " + os.Getenv("XDG_SESSION_DESKTOP"))
+	switch {
+	case strings.Contains(desk, "cinnamon"):
+		// ToggleKeyboard is a toggle, so the same command serves both ways;
+		// the panel tracks which state it believes the keyboard is in.
+		return oskDefault{"cinnamon", cinnamonToggle, cinnamonToggle}
+	case strings.Contains(desk, "gnome"), strings.Contains(desk, "kde"), strings.Contains(desk, "plasma"):
+		// These shells show their own keyboard in response to
+		// SW_TABLET_MODE, which hinged now supplies, so driving one here
+		// would fight the desktop.
+		return oskDefault{"builtin", "", ""}
+	case hasBinary("wvkbd-mobintl"):
+		return oskDefault{"wvkbd", "wvkbd-mobintl -L 320", "pkill -x wvkbd-mobintl"}
+	default:
+		return oskDefault{"onboard", "onboard", "pkill -KILL -x onboard"}
+	}
+}
+
+func hasBinary(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
 
 func defaultVoxSocket() string {
 	if s := os.Getenv("VOX_SOCKET"); s != "" {
@@ -470,6 +512,10 @@ func (p *panel) toggleVoice() {
 }
 
 func (p *panel) toggleKeyboard() {
+	if len(p.oskShow) == 0 {
+		p.logf("no on-screen keyboard configured; this desktop shows its own")
+		return
+	}
 	if p.kbdShown {
 		p.hideKeyboard()
 		return

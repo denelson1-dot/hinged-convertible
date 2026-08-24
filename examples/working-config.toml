@@ -38,15 +38,16 @@ event   = "closed"
 command = ["pkill", "-x", "hinged-panel"]
 ignore_exit = true
 
-# The panel opens the keyboard on demand, so unfolding just needs to clean up
-# whatever is still showing. Onboard's two quirks are preserved as hook data
-# rather than code, because they are properties of Onboard, not of hinged:
-# auto-show must be off BEFORE hiding or the focused field reopens it, and it
-# must be SIGKILLed because its destructor crashes under Python 3.12.
-[[hooks]]
-event   = "laptop"
-command = ["gsettings", "set", "org.onboard.auto-show", "enabled", "false"]
-
+# On Cinnamon the panel drives the shell's own keyboard over D-Bus rather than
+# launching Onboard. That is not a preference: a shell's menus take a modal
+# grab, and clicking a separate keyboard application dismisses them, so typing
+# into the start menu with Onboard closes the menu. The shell's own keyboard
+# lives in the same process as its menus and does not break their grabs.
+#
+# Onboard is still the better keyboard for ordinary application text fields,
+# and remains the default on desktops that ship no keyboard of their own.
+#
+# Kept as a safety net in case Onboard was started by something else.
 [[hooks]]
 event   = "laptop"
 command = ["pkill", "-KILL", "-x", "onboard"]

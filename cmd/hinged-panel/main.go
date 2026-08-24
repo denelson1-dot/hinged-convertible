@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jezek/xgb"
@@ -65,13 +66,15 @@ const (
 )
 
 type panel struct {
+	mu     sync.Mutex // serialises drawing; see redraw
 	conn   *xgb.Conn
 	win    xproto.Window
 	gc     xproto.Gcontext
 	screen *xproto.ScreenInfo
 
-	state    string // vox state: ready | listening | transcribing
-	kbdShown bool
+	state     string // vox state: ready | listening | transcribing
+	kbdShown  bool
+	lastRaise time.Time
 
 	voxSocket string
 	oskShow   []string
@@ -140,7 +143,8 @@ func (p *panel) createWindow() error {
 		colBackdrop,
 		1, // override-redirect: the window manager leaves this window alone,
 		//    which is what guarantees it never takes focus.
-		uint32(xproto.EventMaskExposure | xproto.EventMaskButtonPress),
+		uint32(xproto.EventMaskExposure | xproto.EventMaskButtonPress |
+			xproto.EventMaskVisibilityChange),
 	}
 
 	if err := xproto.CreateWindowChecked(p.conn, p.screen.RootDepth, p.win, p.screen.Root,
@@ -159,7 +163,34 @@ func (p *panel) createWindow() error {
 		return err
 	}
 
-	return xproto.MapWindowChecked(p.conn, p.win).Check()
+	if err := xproto.MapWindowChecked(p.conn, p.win).Check(); err != nil {
+		return err
+	}
+	p.raise()
+	return nil
+}
+
+// raise puts the panel back on top.
+//
+// This is necessary precisely because the window is override-redirect. That
+// property is what stops the window manager giving it focus, but it also opts
+// the window out of everything else the WM does -- including keeping it above
+// other windows. The GTK implementation this replaces got both behaviours
+// separately, via set_accept_focus(false) and set_keep_above(true); an
+// unmanaged window has to maintain its own stacking.
+//
+// Without this the panel is mapped on top, then buried by the next window that
+// raises itself, which on a desktop session is almost immediately.
+func (p *panel) raise() {
+	// Rate-limited so that a fight with another always-on-top window cannot
+	// turn into a busy loop of mutual raising.
+	if time.Since(p.lastRaise) < 150*time.Millisecond {
+		return
+	}
+	p.lastRaise = time.Now()
+	xproto.ConfigureWindow(p.conn, p.win,
+		xproto.ConfigWindowStackMode, []uint32{xproto.StackModeAbove})
+	p.conn.Sync()
 }
 
 // watchVox subscribes to state changes so the microphone button reflects what
@@ -207,6 +238,13 @@ func (p *panel) eventLoop() error {
 			p.redraw()
 		case xproto.ButtonPressEvent:
 			p.click(e.EventY)
+		case xproto.VisibilityNotifyEvent:
+			// Anything other than fully visible means something stacked above
+			// us. Onboard mapping its own window is the common case.
+			if e.State != xproto.VisibilityUnobscured {
+				p.raise()
+				p.redraw()
+			}
 		}
 	}
 }
@@ -251,6 +289,14 @@ func (p *panel) toggleKeyboard() {
 		}
 	}
 	p.kbdShown = true
+	// The keyboard maps its window above ours, so reclaim the top immediately
+	// rather than waiting for the visibility event to arrive.
+	go func() {
+		for i := 0; i < 10; i++ {
+			time.Sleep(200 * time.Millisecond)
+			p.raise()
+		}
+	}()
 	p.redraw()
 }
 
@@ -276,6 +322,12 @@ func (p *panel) fill(x, y int16, w, h uint16, c uint32) {
 }
 
 func (p *panel) redraw() {
+	// Drawing is a sequence of "set colour, then draw" pairs, so two
+	// goroutines interleaving would paint with each other's colours. The vox
+	// state watcher and the X event loop both redraw.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.fill(0, 0, panelW, panelH, colBackdrop)
 
 	micY := int16(pad)
